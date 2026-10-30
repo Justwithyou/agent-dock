@@ -57,13 +57,14 @@ cargo build -p adock-cli
 cargo run -p adock-cli -- --help
 ```
 
-初始化一个独立资产工作区并完成校验：
+直接使用与工具仓库同级的现有资产工作区并完成校验：
 
 ```bash
-cargo run -p adock-cli -- --workspace ./agent-dock-assets init
-cargo run -p adock-cli -- --workspace ./agent-dock-assets list
-cargo run -p adock-cli -- --workspace ./agent-dock-assets validate
+cargo run -p adock-cli -- --workspace ../agent-dock-assets list
+cargo run -p adock-cli -- --workspace ../agent-dock-assets validate
 ```
+
+只有需要创建另一套全新的资产仓库时，才在空目录中执行 `adock --workspace <PATH> init`。
 
 启动桌面开发版本：
 

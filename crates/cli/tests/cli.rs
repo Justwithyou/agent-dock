@@ -62,7 +62,7 @@ fn initialize_repository(root: &Path) {
     git(root, &["config", "user.email", "tests@example.invalid"]);
     fs::write(
         root.join("adock.yaml"),
-        "default_channel: prod\ntargets: {}\n",
+        "default_channel: prod\ntargets:\n  trae:\n    root: target/trae\n  codex:\n    root: target/codex\n",
     )
     .unwrap();
 }
@@ -634,4 +634,280 @@ fn help_documents_revision_defaults_and_confirmation_rules() {
             "without --yes no files are written",
         ))
         .stdout(predicate::str::contains("--to <REV>"));
+    Command::cargo_bin("adock")
+        .unwrap()
+        .args(["distribute", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace prod release channel"))
+        .stdout(predicate::str::contains("--target"))
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--overwrite-managed"))
+        .stdout(predicate::str::contains("--yes"));
+}
+
+#[test]
+fn distribute_previews_and_executes_prompt_and_skill_from_traceable_revisions() {
+    let fixture = Fixture::new();
+    git(
+        &fixture.root,
+        &["tag", "adock/prompt/review/prod", &fixture.first],
+    );
+    git(
+        &fixture.root,
+        &["tag", "adock/skill/onboard/prod", &fixture.second],
+    );
+    let prompt_path = fixture.root.join("target/trae/commands/review.md");
+
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--var",
+            "change=PATCH",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Source: adock/prompt/review/prod"))
+        .stdout(predicate::str::contains(format!(
+            "Commit: {}",
+            fixture.first
+        )))
+        .stdout(predicate::str::contains("added |"))
+        .stdout(predicate::str::contains("Dry-run only"));
+    assert!(!prompt_path.exists());
+
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--var",
+            "change=PATCH",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Execution status: completed"))
+        .stdout(predicate::str::contains("written |"))
+        .stdout(predicate::str::contains(format!(
+            "Distribution completed from commit {}",
+            fixture.first
+        )));
+    let distributed = fs::read_to_string(&prompt_path).unwrap();
+    assert!(distributed.contains("Review PATCH in a concise style."));
+    assert!(distributed.contains("first prompt"));
+    assert!(!distributed.contains("second prompt"));
+
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--var",
+            "change=PATCH",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged |"));
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--ref",
+            "HEAD",
+            "--var",
+            "change=PATCH",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Source: HEAD"))
+        .stdout(predicate::str::contains(format!(
+            "Commit: {}",
+            fixture.second
+        )))
+        .stdout(predicate::str::contains("updated |"));
+
+    let skill_entry = fixture.root.join("target/trae/skills/onboard/SKILL.md");
+    let skill_script = fixture
+        .root
+        .join("target/trae/skills/onboard/scripts/run.sh");
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "skill",
+            "onboard",
+            "--target",
+            "trae",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skill:onboard -> trae"))
+        .stdout(predicate::str::contains("added |"));
+    assert!(!skill_entry.exists());
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "skill",
+            "onboard",
+            "--target",
+            "trae",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Execution status: completed"));
+    assert!(
+        fs::read_to_string(skill_entry)
+            .unwrap()
+            .contains("second skill")
+    );
+    assert_eq!(
+        fs::read_to_string(skill_script).unwrap(),
+        "echo second skill\n"
+    );
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "skill",
+            "onboard",
+            "--target",
+            "trae",
+            "--var",
+            "change=PATCH",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error[invalid_input]"));
+}
+
+#[test]
+fn distribute_blocks_unmanaged_files_and_requires_explicit_managed_overwrite() {
+    let fixture = Fixture::new();
+    let prompt_path = fixture.root.join("target/trae/commands/review.md");
+    fs::create_dir_all(prompt_path.parent().unwrap()).unwrap();
+    fs::write(&prompt_path, "unmanaged local file\n").unwrap();
+
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--ref",
+            "HEAD",
+            "--var",
+            "change=PATCH",
+            "--overwrite-managed",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Plan status: blocked"))
+        .stdout(predicate::str::contains("unmanaged_file"))
+        .stderr(predicate::str::contains("error[distribution_conflict]"));
+    assert_eq!(
+        fs::read_to_string(&prompt_path).unwrap(),
+        "unmanaged local file\n"
+    );
+
+    fs::remove_file(&prompt_path).unwrap();
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--ref",
+            "HEAD",
+            "--var",
+            "change=PATCH",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    fs::write(&prompt_path, "managed but locally modified\n").unwrap();
+
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--ref",
+            "HEAD",
+            "--var",
+            "change=PATCH",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("locally_modified"))
+        .stderr(predicate::str::contains("--overwrite-managed"));
+    assert_eq!(
+        fs::read_to_string(&prompt_path).unwrap(),
+        "managed but locally modified\n"
+    );
+
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--ref",
+            "HEAD",
+            "--var",
+            "change=PATCH",
+            "--overwrite-managed",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Plan status: ready"))
+        .stdout(predicate::str::contains("updated |"));
+    assert_eq!(
+        fs::read_to_string(&prompt_path).unwrap(),
+        "managed but locally modified\n"
+    );
+
+    adock(&fixture.root)
+        .args([
+            "distribute",
+            "prompt",
+            "review",
+            "--target",
+            "trae",
+            "--ref",
+            "HEAD",
+            "--var",
+            "change=PATCH",
+            "--overwrite-managed",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Execution status: completed"));
+    assert!(
+        fs::read_to_string(prompt_path)
+            .unwrap()
+            .contains("Review PATCH in a concise style.")
+    );
 }

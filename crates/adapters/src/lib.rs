@@ -1,5 +1,6 @@
 mod distribution;
 mod git;
+mod workflow;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -7,6 +8,7 @@ use adock_core::{AppError, AppErrorCode, AssetKind, DistributionAdapter};
 
 pub use distribution::{PromptAdapter, SkillAdapter};
 pub use git::{GitCli, GitLogEntry, GitRepository, ResolvedRevision};
+pub use workflow::{DistributionRequest, DistributionTargetOptions, DistributionWorkflow};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AdapterKey {

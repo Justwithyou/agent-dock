@@ -4,14 +4,16 @@ use std::{
     process::ExitCode,
 };
 
-use adock_adapters::GitRepository;
+use adock_adapters::{DistributionRequest, DistributionWorkflow, GitRepository};
 use adock_core::{
     AppError, AppErrorCode, Asset, AssetDiff, AssetKind, AssetRef, AssetSpec, ChangeKind,
-    DiagnosticSeverity, RevisionSelector, ValidationReport, VersionTag, WorkspaceInfo,
-    WorkspaceService, render_prompt,
+    DiagnosticSeverity, DistributionConflict, DistributionExecution, DistributionExecutionStatus,
+    DistributionFileStatus, DistributionPlan, DistributionPlanStatus, PlannedFileStatus,
+    RevisionSelector, ValidationReport, VersionTag, WorkspaceInfo, WorkspaceService, render_prompt,
 };
 use adock_infra::{
-    AssetFilter, AssetListResult, AssetService, FileSystemWorkspaceDiscovery, WorkspaceInitializer,
+    AssetFilter, AssetListResult, AssetService, DistributionService, FileSystemWorkspaceDiscovery,
+    WorkspaceInitializer,
 };
 use clap::{Parser, Subcommand};
 
@@ -22,7 +24,7 @@ use clap::{Parser, Subcommand};
     about = "Manage Prompt and Skill assets and their Git versions",
     subcommand_required = true,
     arg_required_else_help = true,
-    after_help = "Revision selectors: working-tree, HEAD, a full commit SHA, or adock/<kind>/<id>/<name>.\nDefaults: show uses working-tree; log and tag create use HEAD; diff and rollback require explicit revisions.\nVersion tags are never pushed automatically. Rollback never commits, pushes, or moves prod."
+    after_help = "Revision selectors: working-tree, HEAD, a full commit SHA, or adock/<kind>/<id>/<name>.\nDefaults: show uses working-tree; log and tag create use HEAD; diff and rollback require explicit revisions; distribute uses the configured prod channel.\nVersion tags are never pushed automatically. Rollback never commits, pushes, or moves prod. Distribution requires --yes to write."
 )]
 struct Cli {
     /// Workspace directory or a directory inside it (default: current directory).
@@ -109,6 +111,32 @@ enum Commands {
     Tag {
         #[command(subcommand)]
         command: TagCommands,
+    },
+    /// Preview or distribute a committed asset snapshot to a configured target.
+    Distribute {
+        /// Asset type: prompt or skill.
+        #[arg(value_parser = parse_kind)]
+        kind: AssetKind,
+        /// Asset identifier.
+        id: String,
+        /// Configured target identifier, such as claude-code, cursor, trae, codex, or workbuddy.
+        #[arg(long)]
+        target: String,
+        /// Committed source revision (default: the workspace prod release channel).
+        #[arg(long = "ref", value_name = "REV", value_parser = parse_revision)]
+        reference: Option<RevisionSelector>,
+        /// Explicitly render a Prompt with NAME=VALUE; repeatable and not valid for Skills.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        variables: Vec<String>,
+        /// Preview the plan without writing files; this is also the default without --yes.
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
+        /// Confirm execution of the previewed plan; without this flag no files are written.
+        #[arg(long)]
+        yes: bool,
+        /// Explicitly overwrite locally modified files already managed by AgentDock; unmanaged files remain blocked.
+        #[arg(long)]
+        overwrite_managed: bool,
     },
     /// Preview or restore an asset to --to; without --yes no files are written.
     Rollback {
@@ -336,6 +364,61 @@ fn run(cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
         },
+        Commands::Distribute {
+            kind,
+            id,
+            target,
+            reference: revision,
+            variables,
+            dry_run,
+            yes,
+            overwrite_managed,
+        } => {
+            let root = discover_workspace(workspace.as_deref())?.root;
+            let request = DistributionRequest {
+                reference: AssetRef::new(kind, id)?,
+                target,
+                revision,
+                variables: parse_variables(&variables)?,
+                overwrite_managed,
+            };
+            let plan = DistributionWorkflow::new(root).create_plan(&request)?;
+            print_distribution_plan(&plan);
+            if plan.status == DistributionPlanStatus::Blocked {
+                return Err(blocked_distribution_error(&plan));
+            }
+            if dry_run || !yes {
+                println!("Dry-run only; no files changed. Re-run with --yes to execute this plan.");
+                return Ok(());
+            }
+
+            let execution = DistributionService::execute(&plan)?;
+            print_distribution_execution(&execution);
+            if execution.status == DistributionExecutionStatus::Completed {
+                println!(
+                    "Distribution completed from commit {}; manifest updated.",
+                    plan.commit
+                );
+                Ok(())
+            } else {
+                println!(
+                    "Distribution did not complete. Fix the reported target error, regenerate the plan, and retry; unchanged and skipped files are listed above."
+                );
+                Err(execution
+                    .files
+                    .iter()
+                    .find_map(|file| file.error.clone())
+                    .unwrap_or_else(|| {
+                        AppError::new(
+                            AppErrorCode::FileWrite,
+                            "cli.distribute",
+                            plan.target,
+                            "one or more target files were not written",
+                            "Fix the target error, regenerate the plan, and retry",
+                        )
+                    }))
+            }
+        }
         Commands::Rollback { kind, id, to, yes } => {
             let reference = AssetRef::new(kind, id)?;
             let root = discover_workspace(workspace.as_deref())?.root;
@@ -529,6 +612,93 @@ fn print_diff(diff: &AssetDiff) {
                 println!();
             }
         }
+    }
+}
+
+fn print_distribution_plan(plan: &DistributionPlan) {
+    println!("Distribution plan: {} -> {}", plan.asset, plan.target);
+    println!("Source: {}", plan.source);
+    println!("Commit: {}", plan.commit);
+    println!("Target root: {}", plan.target_root.display());
+    println!("Adapter: {}", plan.adapter_version);
+    println!(
+        "Plan status: {}",
+        match plan.status {
+            DistributionPlanStatus::Ready => "ready",
+            DistributionPlanStatus::Blocked => "blocked",
+        }
+    );
+    println!("Files:");
+    for file in &plan.files {
+        let status = match file.status {
+            PlannedFileStatus::Added => "added",
+            PlannedFileStatus::Updated => "updated",
+            PlannedFileStatus::Unchanged => "unchanged",
+            PlannedFileStatus::Conflict => "conflict",
+        };
+        print!("  {status} | {}", file.target_path.display());
+        if let Some(conflict) = file.conflict {
+            print!(
+                " | {}",
+                match conflict {
+                    DistributionConflict::UnmanagedFile => "unmanaged_file",
+                    DistributionConflict::LocallyModified => "locally_modified",
+                }
+            );
+        }
+        println!(" | sha256:{}", file.checksum);
+    }
+}
+
+fn blocked_distribution_error(plan: &DistributionPlan) -> AppError {
+    let file = plan.files.iter().find(|file| file.conflict.is_some());
+    let (subject, conflict) = file
+        .map(|file| (file.relative_path.as_str(), file.conflict))
+        .unwrap_or((plan.target.as_str(), None));
+    let (reason, suggestion) = match conflict {
+        Some(DistributionConflict::UnmanagedFile) => (
+            "an unmanaged target file or directory blocks distribution",
+            "Move or remove the unmanaged target path, then regenerate the plan; AgentDock will not overwrite it",
+        ),
+        Some(DistributionConflict::LocallyModified) => (
+            "a managed target file has local modifications",
+            "Review and back up the local changes, then re-run with --overwrite-managed to explicitly replace them",
+        ),
+        None => (
+            "the distribution plan is blocked",
+            "Review the plan conflicts and regenerate it before execution",
+        ),
+    };
+    AppError::new(
+        AppErrorCode::DistributionConflict,
+        "cli.distribute",
+        subject,
+        reason,
+        suggestion,
+    )
+}
+
+fn print_distribution_execution(execution: &DistributionExecution) {
+    println!(
+        "Execution status: {}",
+        match execution.status {
+            DistributionExecutionStatus::Completed => "completed",
+            DistributionExecutionStatus::PartialFailed => "partial_failed",
+            DistributionExecutionStatus::Failed => "failed",
+        }
+    );
+    for file in &execution.files {
+        let status = match file.status {
+            DistributionFileStatus::Written => "written",
+            DistributionFileStatus::Unchanged => "unchanged",
+            DistributionFileStatus::Failed => "failed",
+            DistributionFileStatus::Skipped => "skipped",
+        };
+        print!("  {status} | {}", file.target_path.display());
+        if let Some(error) = &file.error {
+            print!(" | error[{}]: {}", error_code(error.code), error.reason);
+        }
+        println!();
     }
 }
 

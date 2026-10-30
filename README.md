@@ -1,5 +1,10 @@
 # AgentDock
 
+[![CI](https://github.com/Justwithyou/agent-dock/actions/workflows/ci.yml/badge.svg)](https://github.com/Justwithyou/agent-dock/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](Cargo.toml#L12)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml#L14)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 AgentDock 是面向研发团队的 AI 能力资产管理工具：以 Git 为唯一事实源，统一管理 Prompt 与 Skill，并通过同一 Rust Core 为 `adock` CLI 和 Tauri 桌面端提供版本管理与安全分发能力。
 
 ## 当前能力
@@ -154,11 +159,16 @@ cargo test --workspace
 
 现有 Windows CI 执行相同检查，并额外验证初始化资产。测试使用隔离临时 Git 仓库、Prompt / Skill fixtures 和适配器黄金文件，不依赖开发者本机真实资产。
 
+## 版本与协议
+
+当前版本为 `0.1.0`，处于 MVP 研发阶段，尚未发布稳定 Release；版本号由 Cargo workspace 统一维护。
+
+本项目基于 [MIT License](LICENSE) 开源，可自由使用、修改和分发，但需保留原始版权与协议声明。
+
 ## 文档与进度
 
 - [产品设计](Product-Design.md)
 - [开发任务与阶段验收](Development-Tasks.md)
-- [阶段 7 分发设计](docs/superpowers/specs/2026-10-30-phase-7-distribution-design.md)
 - [测试约定](tests/README.md)
 
 阶段 8 将接入 CLI 与桌面端分发闭环；后续统一入口、系统加固和发布验收以开发任务清单为准。

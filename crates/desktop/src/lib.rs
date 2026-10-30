@@ -1,13 +1,16 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
-use adock_adapters::{GitLogEntry, GitRepository};
+use adock_adapters::{
+    DistributionRequest, DistributionTargetOptions, DistributionWorkflow, GitLogEntry,
+    GitRepository,
+};
 use adock_core::{
-    AppError, Asset, AssetDiff, AssetRef, RevisionSelector, ValidationReport, VersionTag,
-    WorkspaceInfo, WorkspaceService,
+    AppError, AppErrorCode, Asset, AssetDiff, AssetRef, DistributionExecution, DistributionPlan,
+    RevisionSelector, ValidationReport, VersionTag, WorkspaceInfo, WorkspaceService,
 };
 use adock_infra::{
-    AssetFilter, AssetService, FileSystemWorkspaceDiscovery, WorkspaceInitializer,
-    load_workspace_config,
+    AssetFilter, AssetService, DistributionService, FileSystemWorkspaceDiscovery,
+    WorkspaceInitializer, load_workspace_config,
 };
 use serde::Serialize;
 
@@ -166,6 +169,55 @@ fn rollback_asset(
     )
 }
 
+#[tauri::command]
+fn get_distribution_options(
+    path: String,
+    reference: String,
+) -> Result<DistributionTargetOptions, AppError> {
+    let root = discover_workspace(Some(path))?.root;
+    DistributionWorkflow::new(root).target_options(&AssetRef::parse(&reference)?)
+}
+
+#[tauri::command]
+fn preview_distribution(
+    path: String,
+    reference: String,
+    target: String,
+    revision: Option<String>,
+    variables: BTreeMap<String, String>,
+    overwrite_managed: bool,
+) -> Result<DistributionPlan, AppError> {
+    let revision = revision
+        .filter(|revision| !revision.trim().is_empty())
+        .map(|revision| RevisionSelector::parse(&revision))
+        .transpose()?;
+    let root = discover_workspace(Some(path))?.root;
+    DistributionWorkflow::new(root).create_plan(&DistributionRequest {
+        reference: AssetRef::parse(&reference)?,
+        target,
+        revision,
+        variables,
+        overwrite_managed,
+    })
+}
+
+#[tauri::command]
+fn execute_distribution(
+    plan: DistributionPlan,
+    confirmed: bool,
+) -> Result<DistributionExecution, AppError> {
+    if !confirmed {
+        return Err(AppError::new(
+            AppErrorCode::ConfirmationRequired,
+            "desktop.distribution.execute",
+            plan.asset.to_string(),
+            "distribution execution requires explicit confirmation",
+            "Review the current plan and confirm before writing target files",
+        ));
+    }
+    DistributionService::execute(&plan)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -179,7 +231,10 @@ pub fn run() {
             diff_asset,
             create_version_tag,
             preview_rollback,
-            rollback_asset
+            rollback_asset,
+            get_distribution_options,
+            preview_distribution,
+            execute_distribution
         ])
         .run(tauri::generate_context!())
         .expect("failed to run the AgentDock desktop application");
@@ -193,7 +248,10 @@ mod tests {
         process::Command as ProcessCommand,
     };
 
-    use adock_core::AppErrorCode;
+    use adock_core::{
+        AppErrorCode, DistributionConflict, DistributionExecutionStatus, DistributionPlanStatus,
+        PlannedFileStatus,
+    };
     use assert_cmd::Command;
 
     use super::*;
@@ -215,7 +273,7 @@ mod tests {
             git(&root, &["config", "user.email", "tests@example.invalid"]);
             fs::write(
                 root.join("adock.yaml"),
-                "default_channel: prod\ntargets: {}\n",
+                "default_channel: prod\ntargets:\n  trae:\n    root: target/trae\n  codex:\n    root: target/codex\n",
             )
             .unwrap();
             write_prompt(&root, "first prompt");
@@ -308,6 +366,58 @@ mod tests {
             format!("echo {marker}\n"),
         )
         .unwrap();
+    }
+
+    fn write_renderable_prompt(root: &Path, marker: &str) {
+        fs::write(
+            root.join("prompts/review.md"),
+            format!(
+                "---\napiVersion: adock/v1alpha1\nkind: prompt\nid: review\ntitle: Review\ndescription: Review code\nowners: [alice]\nspec:\n  variables:\n    - name: change\n      required: true\n    - name: tone\n      default: concise\n---\nReview {{{{change}}}} in a {{{{tone}}}} style.\n{marker}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn create_prod(fixture: &VersionFixture, reference: &str, target: &str) {
+        create_version_tag(
+            fixture.path(),
+            reference.to_owned(),
+            "prod".to_owned(),
+            target.to_owned(),
+            true,
+            true,
+        )
+        .unwrap();
+    }
+
+    fn assert_cli_matches_plan(output: &[u8], plan: &DistributionPlan) {
+        let output = String::from_utf8_lossy(output);
+        for expected in [
+            format!("Distribution plan: {} -> {}", plan.asset, plan.target),
+            format!("Source: {}", plan.source),
+            format!("Commit: {}", plan.commit),
+            format!("Target root: {}", plan.target_root.display()),
+            format!("Adapter: {}", plan.adapter_version),
+        ] {
+            assert!(output.contains(&expected), "missing {expected:?}\n{output}");
+        }
+        for file in &plan.files {
+            let status = match file.status {
+                PlannedFileStatus::Added => "added",
+                PlannedFileStatus::Updated => "updated",
+                PlannedFileStatus::Unchanged => "unchanged",
+                PlannedFileStatus::Conflict => "conflict",
+            };
+            let mut expected = format!("  {status} | {}", file.target_path.display());
+            if let Some(conflict) = file.conflict {
+                expected.push_str(match conflict {
+                    DistributionConflict::UnmanagedFile => " | unmanaged_file",
+                    DistributionConflict::LocallyModified => " | locally_modified",
+                });
+            }
+            expected.push_str(&format!(" | sha256:{}", file.checksum));
+            assert!(output.contains(&expected), "missing {expected:?}\n{output}");
+        }
     }
 
     #[test]
@@ -577,5 +687,336 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, AppErrorCode::DirtyAsset);
+    }
+
+    #[test]
+    fn distribution_plans_and_execution_match_cli_for_prompts_and_skills() {
+        let fixture = VersionFixture::new();
+        write_renderable_prompt(&fixture.root, "prod prompt");
+        commit_all(&fixture.root, "renderable prompt");
+        let prod_commit = head(&fixture.root);
+        create_prod(&fixture, "prompt:review", &prod_commit);
+        create_prod(&fixture, "skill:onboard", &prod_commit);
+
+        let options = get_distribution_options(fixture.path(), "prompt:review".to_owned()).unwrap();
+        assert_eq!(options.default_revision, "adock/prompt/review/prod");
+        assert!(options.targets.iter().any(|target| target.target == "trae"));
+
+        let variables = BTreeMap::from([
+            ("change".to_owned(), "PATCH".to_owned()),
+            ("tone".to_owned(), "detailed".to_owned()),
+        ]);
+        let prompt_plan = preview_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            None,
+            variables.clone(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(prompt_plan.status, DistributionPlanStatus::Ready);
+        assert_eq!(prompt_plan.commit, prod_commit);
+        assert!(prompt_plan.files.iter().any(|file| {
+            String::from_utf8_lossy(&file.content)
+                .contains("Review PATCH in a detailed style.\nprod prompt")
+        }));
+        let output = fixture
+            .cli()
+            .args([
+                "distribute",
+                "prompt",
+                "review",
+                "--target",
+                "trae",
+                "--var",
+                "change=PATCH",
+                "--var",
+                "tone=detailed",
+                "--dry-run",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_cli_matches_plan(&output, &prompt_plan);
+
+        let error = execute_distribution(prompt_plan.clone(), false).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ConfirmationRequired);
+        assert!(
+            prompt_plan
+                .files
+                .iter()
+                .all(|file| !file.target_path.exists())
+        );
+        let execution = execute_distribution(prompt_plan.clone(), true).unwrap();
+        assert_eq!(execution.status, DistributionExecutionStatus::Completed);
+        for file in &prompt_plan.files {
+            assert_eq!(fs::read(&file.target_path).unwrap(), file.content);
+        }
+        let output = fixture
+            .cli()
+            .args([
+                "distribute",
+                "prompt",
+                "review",
+                "--target",
+                "trae",
+                "--var",
+                "change=PATCH",
+                "--var",
+                "tone=detailed",
+                "--yes",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("Execution status: completed"));
+        assert!(output.contains("unchanged |"));
+
+        write_renderable_prompt(&fixture.root, "head prompt");
+        commit_all(&fixture.root, "head-only prompt");
+        let head_commit = head(&fixture.root);
+        let head_plan = preview_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            Some("HEAD".to_owned()),
+            variables.clone(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(head_plan.commit, head_commit);
+        assert!(
+            head_plan
+                .files
+                .iter()
+                .any(|file| { String::from_utf8_lossy(&file.content).contains("head prompt") })
+        );
+        let default_plan = preview_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            None,
+            variables,
+            false,
+        )
+        .unwrap();
+        assert_eq!(default_plan.commit, prod_commit);
+        assert!(
+            default_plan
+                .files
+                .iter()
+                .all(|file| { !String::from_utf8_lossy(&file.content).contains("head prompt") })
+        );
+        let output = fixture
+            .cli()
+            .args([
+                "distribute",
+                "prompt",
+                "review",
+                "--target",
+                "trae",
+                "--ref",
+                "HEAD",
+                "--var",
+                "change=PATCH",
+                "--var",
+                "tone=detailed",
+                "--dry-run",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_cli_matches_plan(&output, &head_plan);
+
+        let skill_options =
+            get_distribution_options(fixture.path(), "skill:onboard".to_owned()).unwrap();
+        assert_eq!(skill_options.default_revision, "adock/skill/onboard/prod");
+        assert!(
+            skill_options
+                .targets
+                .iter()
+                .any(|target| target.target == "codex")
+        );
+        let skill_plan = preview_distribution(
+            fixture.path(),
+            "skill:onboard".to_owned(),
+            "codex".to_owned(),
+            None,
+            BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(skill_plan.status, DistributionPlanStatus::Ready);
+        assert_eq!(skill_plan.commit, prod_commit);
+        assert!(skill_plan.files.len() >= 2);
+        let output = fixture
+            .cli()
+            .args([
+                "distribute",
+                "skill",
+                "onboard",
+                "--target",
+                "codex",
+                "--dry-run",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_cli_matches_plan(&output, &skill_plan);
+        let error = execute_distribution(skill_plan.clone(), false).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ConfirmationRequired);
+        assert!(
+            skill_plan
+                .files
+                .iter()
+                .all(|file| !file.target_path.exists())
+        );
+        let execution = execute_distribution(skill_plan.clone(), true).unwrap();
+        assert_eq!(execution.status, DistributionExecutionStatus::Completed);
+        for file in &skill_plan.files {
+            assert_eq!(fs::read(&file.target_path).unwrap(), file.content);
+        }
+    }
+
+    #[test]
+    fn distribution_conflicts_match_cli_and_require_managed_only_overwrite() {
+        let fixture = VersionFixture::new();
+        create_prod(&fixture, "prompt:review", &fixture.second);
+        let initial = preview_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            None,
+            BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        let target_path = initial.files[0].target_path.clone();
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, "unmanaged\n").unwrap();
+
+        let blocked = preview_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            None,
+            BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(blocked.status, DistributionPlanStatus::Blocked);
+        assert_eq!(blocked.files[0].status, PlannedFileStatus::Conflict);
+        assert_eq!(
+            blocked.files[0].conflict,
+            Some(DistributionConflict::UnmanagedFile)
+        );
+        let assert = fixture
+            .cli()
+            .args([
+                "distribute",
+                "prompt",
+                "review",
+                "--target",
+                "trae",
+                "--overwrite-managed",
+                "--dry-run",
+            ])
+            .assert()
+            .failure();
+        let output = assert.get_output();
+        assert_cli_matches_plan(&output.stdout, &blocked);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error[distribution_conflict]"));
+        let error = execute_distribution(blocked, true).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::DistributionConflict);
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "unmanaged\n");
+
+        fs::remove_file(&target_path).unwrap();
+        let ready = preview_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            None,
+            BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        execute_distribution(ready, true).unwrap();
+        fs::write(&target_path, "local edit\n").unwrap();
+
+        let managed_blocked = preview_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            None,
+            BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(managed_blocked.status, DistributionPlanStatus::Blocked);
+        assert_eq!(
+            managed_blocked.files[0].conflict,
+            Some(DistributionConflict::LocallyModified)
+        );
+        let output = fixture
+            .cli()
+            .args([
+                "distribute",
+                "prompt",
+                "review",
+                "--target",
+                "trae",
+                "--dry-run",
+            ])
+            .assert()
+            .failure()
+            .get_output()
+            .stdout
+            .clone();
+        assert_cli_matches_plan(&output, &managed_blocked);
+
+        let overwrite = preview_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            None,
+            BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(overwrite.status, DistributionPlanStatus::Ready);
+        assert_eq!(overwrite.files[0].status, PlannedFileStatus::Updated);
+        let output = fixture
+            .cli()
+            .args([
+                "distribute",
+                "prompt",
+                "review",
+                "--target",
+                "trae",
+                "--overwrite-managed",
+                "--dry-run",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_cli_matches_plan(&output, &overwrite);
+        let error = execute_distribution(overwrite.clone(), false).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ConfirmationRequired);
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "local edit\n");
+        let execution = execute_distribution(overwrite.clone(), true).unwrap();
+        assert_eq!(execution.status, DistributionExecutionStatus::Completed);
+        assert_eq!(fs::read(&target_path).unwrap(), overwrite.files[0].content);
     }
 }

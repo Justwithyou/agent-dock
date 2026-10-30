@@ -1,0 +1,14 @@
+[package]
+name = "adock-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adock-core = { path = "../core" }
+adock-infra = { path = "../infra" }
+serde.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "adock-infra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adock-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+jsonschema = { version = "0.33", default-features = false }
+tempfile.workspace = true

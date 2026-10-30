@@ -15,3 +15,7 @@ dist/
 Thumbs.db
 
 .env
+
+/.trae/
+/docs/
+/Prompt.md

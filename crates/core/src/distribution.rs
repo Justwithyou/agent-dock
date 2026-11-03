@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AppError, AppErrorCode, AssetRef, AssetSnapshot, RevisionSelector};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributionScope {
+    #[default]
+    Project,
+    User,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetProfile {
     pub target: String,
@@ -95,6 +103,7 @@ pub struct DistributionPlan {
     pub commit: String,
     pub adapter_version: String,
     pub status: DistributionPlanStatus,
+    pub overwrite_managed: bool,
     pub files: Vec<PlannedFile>,
 }
 
@@ -149,6 +158,7 @@ mod tests {
             commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             adapter_version: "cursor-prompt/v1".to_owned(),
             status: DistributionPlanStatus::Blocked,
+            overwrite_managed: false,
             files: vec![PlannedFile {
                 target_path: PathBuf::from("target/skills/review/SKILL.md"),
                 relative_path: "skills/review/SKILL.md".to_owned(),

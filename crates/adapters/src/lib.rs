@@ -4,11 +4,13 @@ mod workflow;
 
 use std::{collections::HashMap, sync::Arc};
 
-use adock_core::{AppError, AppErrorCode, AssetKind, DistributionAdapter};
+use adock_core::{AppError, AppErrorCode, AssetKind, DistributionAdapter, DistributionScope};
 
 pub use distribution::{PromptAdapter, SkillAdapter};
 pub use git::{GitCli, GitLogEntry, GitRepository, ResolvedRevision};
-pub use workflow::{DistributionRequest, DistributionTargetOptions, DistributionWorkflow};
+pub use workflow::{
+    DistributionRequest, DistributionTargetOptions, DistributionWorkflow, TraeEdition,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AdapterKey {
@@ -91,6 +93,36 @@ impl AdapterRegistry {
         Ok(())
     }
 
+    pub fn supported_targets(&self, kind: AssetKind) -> Vec<String> {
+        let mut targets = self
+            .adapters
+            .keys()
+            .filter(|key| key.kind == kind)
+            .map(|key| key.target.clone())
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets
+    }
+
+    pub fn standard_directory(
+        &self,
+        target: &str,
+        scope: DistributionScope,
+    ) -> Option<&'static str> {
+        if !self.adapters.keys().any(|key| key.target == target) {
+            return None;
+        }
+        match (target, scope) {
+            ("claude-code", _) => Some(".claude"),
+            ("cursor", _) => Some(".cursor"),
+            ("trae", DistributionScope::Project) => Some(".trae"),
+            ("trae", DistributionScope::User) => Some(".trae-cn"),
+            ("codex", _) => Some(".agents"),
+            ("workbuddy", _) => Some(".codebuddy"),
+            _ => None,
+        }
+    }
+
     pub fn adapter(
         &self,
         kind: AssetKind,
@@ -147,5 +179,38 @@ mod tests {
             .expect("Codex Prompt is deliberately unsupported");
         assert_eq!(error.code, AppErrorCode::UnsupportedAdapter);
         assert!(registry.adapter(AssetKind::Skill, "cursor").is_err());
+        assert_eq!(
+            registry.supported_targets(AssetKind::Prompt),
+            ["claude-code", "cursor", "trae", "workbuddy"]
+        );
+        assert_eq!(
+            registry.supported_targets(AssetKind::Skill),
+            ["claude-code", "codex", "trae", "workbuddy"]
+        );
+    }
+
+    #[test]
+    fn standard_directories_cover_every_builtin_tool_and_scope() {
+        let registry = AdapterRegistry::with_builtins();
+        for (target, directory) in [
+            ("claude-code", ".claude"),
+            ("cursor", ".cursor"),
+            ("trae", ".trae"),
+            ("codex", ".agents"),
+            ("workbuddy", ".codebuddy"),
+        ] {
+            assert_eq!(
+                registry.standard_directory(target, DistributionScope::Project),
+                Some(directory)
+            );
+        }
+        assert_eq!(
+            registry.standard_directory("trae", DistributionScope::User),
+            Some(".trae-cn")
+        );
+        assert_eq!(
+            registry.standard_directory("unknown", DistributionScope::User),
+            None
+        );
     }
 }

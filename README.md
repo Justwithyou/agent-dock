@@ -17,7 +17,7 @@ AgentDock 是面向研发团队的 AI 能力资产管理工具：以 Git 为唯�
 - 分发计划、SHA-256 校验、冲突检测、原子写入、失败重试和目标侧清单。
 - Claude Code、Cursor、Trae、Codex、WorkBuddy 首批格式适配器。
 
-> 当前已完成开发阶段 0—7。CLI 与桌面端的分发向导属于阶段 8，尚未开放；现阶段分发能力由共享 Rust 服务提供。
+> 当前已完成开发阶段 0—10，并通过 Windows MVP 发布验收。CLI 与桌面端均提供完整版本管理与分发闭环，团队协作文档、系统加固、独立发布物和干净环境验收均已补齐。
 
 ## 适配器矩阵
 
@@ -77,6 +77,28 @@ cargo run -p adock-cli -- --workspace ../agent-dock-assets validate
 cargo run -p adock-desktop
 ```
 
+## Windows 发布物与安装
+
+在仓库根目录构建独立 CLI，再进入桌面 crate 构建 NSIS 安装包：
+
+```powershell
+cargo build --release -p adock-cli
+Set-Location crates/desktop
+npx --yes @tauri-apps/cli@2 build
+Pop-Location
+```
+
+构建产物：
+
+- CLI：`target/release/adock.exe`（在仓库根目录构建时）。
+- 桌面安装包：`target/release/bundle/nsis/AgentDock_0.1.0_x64-setup.exe`。
+
+安装时运行 NSIS 安装包并选择目录，或将 `adock.exe` 复制到已加入 `PATH` 的目录。桌面端需要 Windows WebView2 Runtime；工作区、版本管理和分发操作需要命令行可访问的 Git。Node.js 仅用于执行上述桌面打包命令，不是 CLI 或桌面端运行依赖。
+
+升级前先退出桌面端，并备份资产仓库中的未提交修改与 `adock.local.yaml`。随后用新版安装包覆盖安装、替换 CLI 可执行文件，再检查 `adock --version`、打开原工作区并执行 `adock validate`。升级不会代替 Git 提交、评审或发布流程。
+
+卸载前同样备份需要保留的本机配置。桌面端可通过 Windows“已安装的应用”或安装目录中的 `uninstall.exe` 卸载；CLI 删除复制出的 `adock.exe` 即可。卸载不会自动删除团队资产仓库、目标侧已分发文件或 `.adock/distribution-manifest.json`，需要清理时应先确认这些文件不再使用。
+
 ## 常用 CLI 命令
 
 以下命令均可通过全局 `--workspace <PATH>` 指定资产工作区：
@@ -108,8 +130,17 @@ adock tag list prompt code-review
 adock tag create prompt code-review prod --move --yes
 
 # 默认仅预览回滚；--yes 才恢复工作区文件，不自动提交
-adock rollback prompt code-review --to adock/prompt/code-review/v1.0.0
-adock rollback prompt code-review --to adock/prompt/code-review/v1.0.0 --yes
+ROLLBACK_COMMIT="$(git rev-parse "adock/prompt/code-review/v1.0.0^{}")"
+adock rollback prompt code-review --to "$ROLLBACK_COMMIT"
+adock rollback prompt code-review --to "$ROLLBACK_COMMIT" --yes
+
+# 分发默认使用 prod；dry-run 与执行共用同一计划规则
+adock distribute prompt code-review --target trae --var change=PATCH --dry-run
+adock distribute prompt code-review --target trae --var change=PATCH --yes
+adock distribute skill repo-onboarding --target codex --dry-run
+
+# 仅已纳管本地修改允许显式覆盖；未纳管冲突始终阻断
+adock distribute prompt code-review --target trae --var change=PATCH --overwrite-managed --dry-run
 ```
 
 Revision 支持 `working-tree`、`HEAD`、完整 commit SHA 和 `adock/<kind>/<id>/<name>`。`show` 默认使用工作区，`log` 与标签创建默认使用 `HEAD`，`diff` 和 `rollback` 必须显式提供 revision。
@@ -167,8 +198,13 @@ cargo test --workspace
 
 ## 文档与进度
 
+- [资产仓库统一入口](https://github.com/Justwithyou/agent-dock-assets#readme)
+- [Prompt 编写规范](https://github.com/Justwithyou/agent-dock-assets/blob/main/docs/prompt-spec.md)
+- [Skill 编写规范](https://github.com/Justwithyou/agent-dock-assets/blob/main/docs/skill-spec.md)
+- [评审与发布流程](https://github.com/Justwithyou/agent-dock-assets/blob/main/docs/review-and-release.md)
+- [端到端示例](https://github.com/Justwithyou/agent-dock-assets/blob/main/docs/end-to-end-example.md)
 - [产品设计](Product-Design.md)
 - [开发任务与阶段验收](Development-Tasks.md)
 - [测试约定](tests/README.md)
 
-阶段 8 将接入 CLI 与桌面端分发闭环；后续统一入口、系统加固和发布验收以开发任务清单为准。
+团队资产与本代码仓库分离维护；统一入口、负责人、评审和资产校验 CI 以资产仓库为准。

@@ -35,3 +35,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo run -p adock-cli -- --workspace $assets validate
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build release CLI
+        run: cargo build --release -p adock-cli
+
+      - name: Build Windows desktop installer
+        working-directory: crates/desktop
+        shell: pwsh
+        run: npx --yes @tauri-apps/cli@2 build
+
+      - name: Upload Windows release candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentdock-windows-x64
+          path: |
+            target/release/adock.exe
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: error

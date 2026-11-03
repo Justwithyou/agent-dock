@@ -15,7 +15,7 @@ pub use asset::{
 pub use distribution::{
     AdapterFile, AdapterOutput, DistributionAdapter, DistributionConflict, DistributionExecution,
     DistributionExecutionStatus, DistributionFileResult, DistributionFileStatus, DistributionPlan,
-    DistributionPlanStatus, PlannedFile, PlannedFileStatus, TargetProfile,
+    DistributionPlanStatus, DistributionScope, PlannedFile, PlannedFileStatus, TargetProfile,
 };
 pub use error::{AppError, AppErrorCode};
 pub use parser::{parse_asset, parse_asset_with_sources};

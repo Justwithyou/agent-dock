@@ -48,7 +48,12 @@ impl AssetService {
 
     pub fn list(&self, filter: &AssetFilter) -> Result<AssetListResult, AppError> {
         let scan = WorkspaceScanner::new(&self.root).scan()?;
-        let query = filter.query.as_ref().map(|query| query.to_lowercase());
+        let query = filter
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_lowercase);
         let assets = scan
             .assets
             .into_iter()
@@ -76,14 +81,39 @@ impl AssetService {
                     asset.metadata.id.to_lowercase().contains(query)
                         || asset.metadata.title.to_lowercase().contains(query)
                         || asset.metadata.description.to_lowercase().contains(query)
+                        || asset.reference().is_ok_and(|reference| {
+                            reference.to_string().to_lowercase().contains(query)
+                        })
+                        || asset
+                            .metadata
+                            .owners
+                            .iter()
+                            .chain(&asset.metadata.labels)
+                            .any(|value| value.to_lowercase().contains(query))
                 })
             })
             .map(list_item)
             .collect();
-        Ok(AssetListResult {
-            assets,
-            issues: scan.issues,
-        })
+        let issues = scan
+            .issues
+            .into_iter()
+            .filter(|issue| {
+                filter.kind.is_none_or(|kind| {
+                    issue
+                        .asset
+                        .as_ref()
+                        .is_some_and(|reference| reference.kind == kind)
+                })
+            })
+            .filter(|_| filter.owner.is_none() && filter.label.is_none())
+            .filter(|issue| {
+                query.as_ref().is_none_or(|query| {
+                    issue.error.subject.to_lowercase().contains(query)
+                        || issue.error.reason.to_lowercase().contains(query)
+                })
+            })
+            .collect();
+        Ok(AssetListResult { assets, issues })
     }
 
     pub fn show(&self, reference: &AssetRef) -> Result<Asset, AppError> {
@@ -219,6 +249,65 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("duplicate variable"))
         );
+    }
+
+    #[test]
+    fn list_filters_share_metadata_and_issue_semantics() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("prompts")).unwrap();
+        fs::create_dir_all(temp.path().join("skills/onboard")).unwrap();
+        fs::write(temp.path().join("prompts/bad.md"), "broken").unwrap();
+        fs::write(
+            temp.path().join("prompts/review.md"),
+            "---\napiVersion: adock/v1alpha1\nkind: prompt\nid: review\ntitle: Review\ndescription: Review code\nowners: [alice]\nlabels: [engineering]\nspec:\n  variables: []\n---\nReview code\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("skills/onboard/SKILL.md"),
+            "---\napiVersion: adock/v1alpha1\nkind: skill\nid: onboard\ntitle: Onboard\ndescription: Onboard a repository\nowners: [bob]\nlabels: [onboarding]\nspec:\n  triggers: []\n  dependencies: []\n---\nInstructions\n",
+        )
+        .unwrap();
+        let service = AssetService::new(temp.path());
+
+        for query in ["ALICE", "engineering", "prompt:review"] {
+            let result = service
+                .list(&AssetFilter {
+                    query: Some(query.to_owned()),
+                    ..AssetFilter::default()
+                })
+                .unwrap();
+            assert_eq!(result.assets.len(), 1, "query: {query}");
+            assert_eq!(result.assets[0].asset.to_string(), "prompt:review");
+            assert!(result.issues.is_empty(), "query: {query}");
+        }
+
+        let result = service
+            .list(&AssetFilter {
+                kind: Some(AssetKind::Skill),
+                ..AssetFilter::default()
+            })
+            .unwrap();
+        assert_eq!(result.assets.len(), 1);
+        assert_eq!(result.assets[0].asset.to_string(), "skill:onboard");
+        assert!(result.issues.is_empty());
+
+        let result = service
+            .list(&AssetFilter {
+                query: Some("bad.md".to_owned()),
+                ..AssetFilter::default()
+            })
+            .unwrap();
+        assert!(result.assets.is_empty());
+        assert_eq!(result.issues.len(), 1);
+
+        let result = service
+            .list(&AssetFilter {
+                query: Some("   ".to_owned()),
+                ..AssetFilter::default()
+            })
+            .unwrap();
+        assert_eq!(result.assets.len(), 2);
+        assert_eq!(result.issues.len(), 1);
     }
 
     #[test]

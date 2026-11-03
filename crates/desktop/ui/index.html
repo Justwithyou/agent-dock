@@ -98,6 +98,7 @@
         assetsLoaded: false,
         assetsError: null,
         entries: [],
+        allEntries: [],
         selectedKey: null,
         detail: null,
         detailLoading: false,
@@ -113,12 +114,14 @@
         modalKind: null,
         distribution: {
           ref: null, options: null, optionsLoading: false, optionsError: null,
-          target: "", revision: "", variables: {}, overwriteManaged: false,
+          mode: "standard", scope: "project", traeEdition: null, target: "", revision: "", variables: {}, overwriteManaged: false,
           plan: null, planLoading: false, planError: null,
           executing: false, execution: null, executionError: null
         }
       };
       let workspaceEpoch = 0;
+      let assetsEpoch = 0;
+      let filterTimer = null;
       let detailEpoch = 0;
       let historyEpoch = 0;
       let diffEpoch = 0;
@@ -132,12 +135,12 @@
           return {
             code: String(error.code || "invoke_failed"),
             operation: String(error.operation || operation),
-            subject: String(error.subject || subject),
-            reason: String(error.reason || error.message || "操作失败"),
-            suggestion: String(error.suggestion || "请检查工作区后重试")
+            subject: displayDiagnostic(error.subject || subject),
+            reason: displayDiagnostic(error.reason || error.message || "操作失败"),
+            suggestion: displayDiagnostic(error.suggestion || "请检查工作区后重试")
           };
         }
-        return {code:"invoke_failed",operation,subject,reason:String(error || "操作失败"),suggestion:"请检查工作区后重试"};
+        return {code:"invoke_failed",operation,subject:displayDiagnostic(subject),reason:displayDiagnostic(error || "操作失败"),suggestion:"请检查工作区后重试"};
       }
 
       async function invoke(command, args) {
@@ -156,13 +159,24 @@
 
       function toast(message, type = "success") {
         clearTimeout(toastTimer);
-        $("#toast-root").innerHTML = `<div class="toast ${type === "error" ? "error" : type === "warn" ? "warn" : ""}" role="status">${icon(type === "error" ? "error" : type === "warn" ? "info" : "check")}<span>${esc(message)}</span></div>`;
+        $("#toast-root").innerHTML = `<div class="toast ${type === "error" ? "error" : type === "warn" ? "warn" : ""}" role="status">${icon(type === "error" ? "error" : type === "warn" ? "info" : "check")}<span>${esc(displayDiagnostic(message))}</span></div>`;
         toastTimer = setTimeout(() => { $("#toast-root").innerHTML = ""; }, 4200);
       }
 
       function rootName(path) {
         const parts = String(path || "").split(/[\\/]/).filter(Boolean);
         return parts[parts.length - 1] || path || "未打开工作区";
+      }
+
+      function displayPath(path) {
+        const value = String(path || "");
+        if (/^\\\\\?\\UNC\\/i.test(value)) return `\\\\${value.slice(8)}`;
+        if (value.startsWith("\\\\?\\")) return value.slice(4);
+        return value;
+      }
+
+      function displayDiagnostic(value) {
+        return String(value ?? "").replace(/\\\\\?\\UNC\\/gi, "\\\\").replace(/\\\\\?\\/g, "");
       }
 
       function selectedEntry() {
@@ -182,7 +196,7 @@
       function renderChrome() {
         const workspace = state.workspace;
         $("#workspace-name").textContent = workspace ? rootName(workspace.root) : state.currentPath ? rootName(state.currentPath) : "未打开工作区";
-        $("#workspace-path").textContent = workspace ? workspace.root : state.currentPath || "选择本地 Git 资产仓库";
+        $("#workspace-path").textContent = workspace ? displayPath(workspace.root) : displayPath(state.currentPath) || "选择本地 Git 资产仓库";
         const hasError = Boolean(state.workspaceError || state.assetsError);
         const branch = workspaceBranch();
         $("#branch-status").innerHTML = workspace || state.currentPath ? `${icon("git")}<span>${esc(branch || "本地仓库")}</span><span class="badge ${hasError ? "error" : workspace ? "success" : "warn"}"><span class="status-dot ${hasError ? "error" : workspace ? "" : "warn"}"></span>${hasError ? "需要处理" : workspace ? "已连接" : "未连接"}</span>` : "";
@@ -190,7 +204,7 @@
         const refresh = $("#refresh-button");
         refresh.innerHTML = state.loadingWorkspace || state.loadingAssets ? '<span class="spinner" style="width:15px;height:15px"></span>' : icon("refresh");
         refresh.disabled = !state.currentPath || state.loadingWorkspace || state.loadingAssets || state.modalBusy;
-        $("#main-nav").innerHTML = navItems.map(([id,label,ico]) => `<button type="button" class="nav-btn ${state.view === id ? "active" : ""}" data-action="nav" data-view="${id}" aria-label="打开${label}页面">${icon(ico)}<span>${label}</span>${id === "assets" ? `<span class="nav-count">${state.entries.length}</span>` : ""}</button>`).join("");
+        $("#main-nav").innerHTML = navItems.map(([id,label,ico]) => `<button type="button" class="nav-btn ${state.view === id ? "active" : ""}" data-action="nav" data-view="${id}" aria-label="打开${label}页面">${icon(ico)}<span>${label}</span>${id === "assets" ? `<span class="nav-count">${state.allEntries.length}</span>` : ""}</button>`).join("");
       }
 
       function pageHead(title, description, actions = "") {
@@ -232,7 +246,7 @@
       }
 
       function renderWelcome() {
-        return `<div class="state-page"><div class="state-icon">${icon("assets")}</div><h1>打开团队能力工作区</h1><p>选择一个包含 adock.yaml 的 Git 资产仓库，直接发现其中的 Prompt 与 Skill。无需导入，也不会创建桌面私有副本。</p><div class="state-diagnostic"><div class="summary-list"><div class="summary-row"><span>资产目录</span><span class="mono">prompts/ · skills/</span></div><div class="summary-row"><span>工作区配置</span><span class="mono">adock.yaml</span></div><div class="summary-row"><span>读取方式</span><span>共享 Rust 应用服务</span></div></div></div><div class="state-actions"><button type="button" class="btn primary" data-action="workspace" aria-label="打开本地工作区">${icon("folder")}打开工作区</button><button type="button" class="btn" data-action="init-workspace" aria-label="初始化新工作区">${icon("plus")}初始化新工作区</button></div>${recentPath ? `<p class="soft mono">最近路径：${esc(recentPath)}</p>` : ""}</div>`;
+        return `<div class="state-page"><div class="state-icon">${icon("assets")}</div><h1>打开团队能力工作区</h1><p>选择一个包含 adock.yaml 的 Git 资产仓库，直接发现其中的 Prompt 与 Skill。无需导入，也不会创建桌面私有副本。</p><div class="state-diagnostic"><div class="summary-list"><div class="summary-row"><span>资产目录</span><span class="mono">prompts/ · skills/</span></div><div class="summary-row"><span>工作区配置</span><span class="mono">adock.yaml</span></div><div class="summary-row"><span>读取方式</span><span>共享 Rust 应用服务</span></div></div></div><div class="state-actions"><button type="button" class="btn primary" data-action="workspace" aria-label="打开本地工作区">${icon("folder")}打开工作区</button><button type="button" class="btn" data-action="init-workspace" aria-label="初始化新工作区">${icon("plus")}初始化新工作区</button></div>${recentPath ? `<p class="soft mono">最近路径：${esc(displayPath(recentPath))}</p>` : ""}</div>`;
       }
 
       function renderAssetsError() {
@@ -240,11 +254,11 @@
       }
 
       function renderEmptyWorkspace() {
-        return `<div class="state-page"><div class="state-icon">${icon("assets")}</div><h1>工作区还没有能力资产</h1><p>目录结构已就绪。通过团队 Git 评审流程新增第一个 Prompt 或 Skill，刷新后即可在这里查看真实详情。</p><div class="state-diagnostic"><div class="summary-list"><div class="summary-row"><span>Prompt 目录</span><span class="mono">prompts/</span></div><div class="summary-row"><span>Skill 目录</span><span class="mono">skills/&lt;skill-id&gt;/SKILL.md</span></div><div class="summary-row"><span>当前工作区</span><span class="mono">${esc(state.workspace.root)}</span></div></div></div><div class="inline-notice">${icon("info")}<div>空资产结果与读取失败分开显示。新增资产仍需遵循仓库规范与 MR/PR 流程，本页面不会伪造创建操作。</div></div><div class="state-actions"><button type="button" class="btn primary" data-action="asset-guide" aria-label="查看新增资产指引">查看新增资产指引</button><button type="button" class="btn" data-action="refresh" aria-label="刷新空工作区">${icon("refresh")}刷新</button></div></div>`;
+        return `<div class="state-page"><div class="state-icon">${icon("assets")}</div><h1>工作区还没有能力资产</h1><p>目录结构已就绪。通过团队 Git 评审流程新增第一个 Prompt 或 Skill，刷新后即可在这里查看真实详情。</p><div class="state-diagnostic"><div class="summary-list"><div class="summary-row"><span>Prompt 目录</span><span class="mono">prompts/</span></div><div class="summary-row"><span>Skill 目录</span><span class="mono">skills/&lt;skill-id&gt;/SKILL.md</span></div><div class="summary-row"><span>当前工作区</span><span class="mono">${esc(displayPath(state.workspace.root))}</span></div></div></div><div class="inline-notice">${icon("info")}<div>空资产结果与读取失败分开显示。新增资产仍需遵循仓库规范与 MR/PR 流程，本页面不会伪造创建操作。</div></div><div class="state-actions"><button type="button" class="btn primary" data-action="asset-guide" aria-label="查看新增资产指引">查看新增资产指引</button><button type="button" class="btn" data-action="refresh" aria-label="刷新空工作区">${icon("refresh")}刷新</button></div></div>`;
       }
 
       function validAssets() {
-        return state.entries.map(entry => entry.asset).filter(Boolean);
+        return state.allEntries.map(entry => entry.asset).filter(Boolean);
       }
 
       function filterValues(field) {
@@ -256,26 +270,6 @@
         const current = state.filters[field];
         if (current !== "all") values.add(current);
         return [...values].sort((a,b) => a.localeCompare(b, "zh-CN"));
-      }
-
-      function filteredEntries() {
-        const filter = state.filters;
-        const keyword = filter.search.trim().toLocaleLowerCase();
-        return state.entries.filter(entry => {
-          const asset = entry.asset;
-          if (!asset) {
-            const errorText = `${entry.error.subject} ${entry.error.reason}`.toLocaleLowerCase();
-            return filter.kind === "all" && filter.owner === "all" && filter.label === "all" && (!keyword || errorText.includes(keyword));
-          }
-          const metadata = asset.metadata;
-          const owners = (metadata.owners || []).map(String);
-          const labels = (metadata.labels || []).map(String);
-          const haystack = [metadata.title, metadata.id, metadata.description, assetRef(asset), ...owners, ...labels].join(" ").toLocaleLowerCase();
-          return (filter.kind === "all" || metadata.kind === filter.kind) &&
-            (filter.owner === "all" || owners.includes(filter.owner)) &&
-            (filter.label === "all" || labels.includes(filter.label)) &&
-            (!keyword || haystack.includes(keyword));
-        });
       }
 
       function hasFilters() {
@@ -321,7 +315,7 @@
         const files = Array.isArray(asset.source_files) ? asset.source_files : [];
         const title = metadata.title || metadata.id || "未命名资产";
         const versionLabels = extractVersionLabels(asset);
-        return `<section class="card asset-detail"><div class="detail-hero"><div class="detail-title"><span class="badge ${kind}">${kind === "prompt" ? "Prompt" : "Skill"}</span><h2>${esc(title)}</h2></div><div class="detail-ref mono">${esc(assetRef(asset))}</div><p class="detail-desc">${esc(metadata.description || "未提供说明")}</p><div class="detail-actions"><button type="button" class="btn" data-action="nav" data-view="history" aria-label="查看资产历史与版本">${icon("history")}查看历史</button><button type="button" class="btn primary" data-action="nav" data-view="distribute" aria-label="查看分发模块接入说明">${icon("distribute")}进入分发</button></div></div><div class="release-strip"><span class="release-item"><span class="soft">当前快照</span><span class="tag version mono">工作区</span></span>${versionLabels.map(label => `<span class="tag version mono">${esc(label)}</span>`).join("")}<span class="spacer"></span><span class="soft">${state.version.loading && state.version.ref === assetRef(asset) ? "正在读取版本标签" : versionLabels.length ? "版本标签" : "暂无版本标签"}</span></div><div class="detail-section"><h3 class="section-title">资产信息<span class="badge success">工作区数据</span></h3><dl class="meta-grid"><div class="meta-item"><dt>资产 ID</dt><dd class="mono">${esc(metadata.id)}</dd></div><div class="meta-item"><dt>负责人</dt><dd>${esc((metadata.owners || []).join(" / ") || "—")}</dd></div><div class="meta-item"><dt>API 版本</dt><dd class="mono">${esc(metadata.api_version || "—")}</dd></div><div class="meta-item"><dt>分类标签</dt><dd class="tags">${(metadata.labels || []).length ? metadata.labels.map(label => `<span class="tag">${esc(label)}</span>`).join("") : "—"}</dd></div><div class="meta-item"><dt>资产类型</dt><dd>${kind === "prompt" ? "Prompt · 单文件" : "Skill · 目录"}</dd></div><div class="meta-item"><dt>源文件范围</dt><dd>${files.length} 个文件</dd></div></dl></div>${kind === "prompt" ? renderPromptInfo(spec, asset.body) : renderSkillInfo(spec, asset.body)}<div class="detail-section"><h3 class="section-title">源文件<span class="soft">${files.length} 个文件</span></h3>${files.length ? files.map(file => `<div class="file-row">${icon("file")}<span class="mono">${esc(file)}</span></div>`).join("") : '<div class="muted">后端未返回源文件。</div>'}</div></section>`;
+        return `<section class="card asset-detail"><div class="detail-hero"><div class="detail-title"><span class="badge ${kind}">${kind === "prompt" ? "Prompt" : "Skill"}</span><h2>${esc(title)}</h2></div><div class="detail-ref mono">${esc(assetRef(asset))}</div><p class="detail-desc">${esc(metadata.description || "未提供说明")}</p><div class="detail-actions"><button type="button" class="btn" data-action="nav" data-view="history" aria-label="查看资产历史与版本">${icon("history")}查看历史</button><button type="button" class="btn primary" data-action="nav" data-view="distribute" aria-label="查看分发模块接入说明">${icon("distribute")}进入分发</button></div></div><div class="release-strip"><span class="release-item"><span class="soft">当前快照</span><span class="tag version mono">工作区</span></span>${versionLabels.map(label => `<span class="tag version mono">${esc(label)}</span>`).join("")}<span class="spacer"></span><span class="soft">${state.version.loading && state.version.ref === assetRef(asset) ? "正在读取版本标签" : versionLabels.length ? "版本标签" : "暂无版本标签"}</span></div><div class="detail-section"><h3 class="section-title">资产信息<span class="badge success">工作区数据</span></h3><dl class="meta-grid"><div class="meta-item"><dt>资产 ID</dt><dd class="mono">${esc(metadata.id)}</dd></div><div class="meta-item"><dt>负责人</dt><dd>${esc((metadata.owners || []).join(" / ") || "—")}</dd></div><div class="meta-item"><dt>API 版本</dt><dd class="mono">${esc(metadata.api_version || "—")}</dd></div><div class="meta-item"><dt>分类标签</dt><dd class="tags">${(metadata.labels || []).length ? metadata.labels.map(label => `<span class="tag">${esc(label)}</span>`).join("") : "—"}</dd></div><div class="meta-item"><dt>资产类型</dt><dd>${kind === "prompt" ? "Prompt · 单文件" : "Skill · 目录"}</dd></div><div class="meta-item"><dt>源文件范围</dt><dd>${files.length} 个文件</dd></div></dl></div>${kind === "prompt" ? renderPromptInfo(spec, asset.body) : renderSkillInfo(spec, asset.body)}<div class="detail-section"><h3 class="section-title">源文件<span class="soft">${files.length} 个文件</span></h3>${files.length ? files.map(file => `<div class="file-row">${icon("file")}<span class="mono">${esc(displayPath(file))}</span></div>`).join("") : '<div class="muted">后端未返回源文件。</div>'}</div></section>`;
       }
 
       function extractVersionLabels(asset) {
@@ -342,12 +336,12 @@
       }
 
       function renderAssets() {
-        const list = filteredEntries();
+        const list = state.entries;
         const owners = filterValues("owner");
         const labels = filterValues("label");
         const loadingText = state.loadingAssets ? '<span class="loading-inline"><span class="spinner"></span>正在读取</span>' : "按工作区读取";
         const actions = `<button type="button" class="btn" data-action="validate" aria-label="校验整个工作区" ${state.validating || state.loadingAssets ? "disabled" : ""}>${icon("check")}${state.validating ? "正在校验…" : "校验工作区"}</button><button type="button" class="btn primary" data-action="asset-guide" aria-label="查看新增资产指引">${icon("plus")}新增资产</button>`;
-        return pageHead("能力资产","发现团队沉淀的 Prompt 与 Skill，查看用途、负责人、变量、依赖和源文件。",actions) + `<div class="asset-layout"><section class="card asset-browser"><div class="filters"><div class="search">${icon("search")}<input data-field="search" value="${esc(state.filters.search)}" placeholder="搜索名称、ID 或说明" aria-label="搜索资产" autocomplete="off"></div><div class="filter-row"><select data-field="kind" aria-label="按资产类型过滤"><option value="all">全部类型</option><option value="prompt" ${state.filters.kind === "prompt" ? "selected" : ""}>Prompt</option><option value="skill" ${state.filters.kind === "skill" ? "selected" : ""}>Skill</option></select><select data-field="owner" aria-label="按负责人过滤"><option value="all">全部负责人</option>${owners.map(owner => `<option value="${esc(owner)}" ${state.filters.owner === owner ? "selected" : ""}>${esc(owner)}</option>`).join("")}</select><select data-field="label" aria-label="按分类标签过滤"><option value="all">全部分类标签</option>${labels.map(label => `<option value="${esc(label)}" ${state.filters.label === label ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></div></div><div class="list-meta"><span>${list.length} / ${state.entries.length} 项资产</span><span class="loading-inline">${loadingText}${hasFilters() ? `<button type="button" class="btn ghost small" data-action="clear-filters" aria-label="清除全部过滤条件">清除过滤</button>` : ""}</span></div><div class="asset-list">${state.loadingAssets && !state.assetsLoaded ? skeletonLines(5) : list.length ? list.map(renderAssetItem).join("") : `<div class="empty-filter">没有符合当前条件的资产。<br><button type="button" class="btn small" data-action="clear-filters" aria-label="清除资产过滤条件">清除过滤</button></div>`}</div></section>${renderAssetDetail()}</div>`;
+        return pageHead("能力资产","发现团队沉淀的 Prompt 与 Skill，查看用途、负责人、变量、依赖和源文件。",actions) + `<div class="asset-layout"><section class="card asset-browser"><div class="filters"><div class="search">${icon("search")}<input data-field="search" value="${esc(state.filters.search)}" placeholder="搜索名称、ID 或说明" aria-label="搜索资产" autocomplete="off"></div><div class="filter-row"><select data-field="kind" aria-label="按资产类型过滤"><option value="all">全部类型</option><option value="prompt" ${state.filters.kind === "prompt" ? "selected" : ""}>Prompt</option><option value="skill" ${state.filters.kind === "skill" ? "selected" : ""}>Skill</option></select><select data-field="owner" aria-label="按负责人过滤"><option value="all">全部负责人</option>${owners.map(owner => `<option value="${esc(owner)}" ${state.filters.owner === owner ? "selected" : ""}>${esc(owner)}</option>`).join("")}</select><select data-field="label" aria-label="按分类标签过滤"><option value="all">全部分类标签</option>${labels.map(label => `<option value="${esc(label)}" ${state.filters.label === label ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></div></div><div class="list-meta"><span>${list.length} / ${state.allEntries.length} 项资产</span><span class="loading-inline">${loadingText}${hasFilters() ? `<button type="button" class="btn ghost small" data-action="clear-filters" aria-label="清除全部过滤条件">清除过滤</button>` : ""}</span></div><div class="asset-list">${state.loadingAssets && !state.assetsLoaded ? skeletonLines(5) : list.length ? list.map(renderAssetItem).join("") : `<div class="empty-filter">没有符合当前条件的资产。<br><button type="button" class="btn small" data-action="clear-filters" aria-label="清除资产过滤条件">清除过滤</button></div>`}</div></section>${renderAssetDetail()}</div>`;
       }
 
       function shortSha(value) {
@@ -376,7 +370,7 @@
         if (!diff) return "";
         const files = Array.isArray(diff.files) ? diff.files : [];
         const changeLabels = {added:"新增",removed:"删除",modified:"修改"};
-        return `<div class="diff-summary"><span class="mono">${esc(shortSha(diff.from_commit))}</span><span>→</span><span class="mono">${esc(diff.to_commit || "工作区")}</span><span class="badge">${files.length} 个变化文件</span></div>${files.length ? `<div class="diff-files">${files.map(file => `<section class="diff-file"><div class="diff-file-head"><span class="badge ${file.change === "removed" ? "error" : file.change === "added" ? "success" : "warn"}">${esc(changeLabels[file.change] || file.change)}</span><span class="diff-path mono">${esc(file.path)}</span>${file.binary ? '<span class="badge warn">二进制</span>' : ""}</div>${file.binary ? `<div class="binary-note">二进制文件已变化，不生成文本差异。</div>` : file.text_diff ? `<pre class="diff-text">${file.text_diff.replace(/\n$/, "").split("\n").map(line => `<span class="diff-line ${line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : line.startsWith("@@") ? "hunk" : ""}">${esc(line)}</span>`).join("")}</pre>` : '<div class="binary-note">无可用文本差异。</div>'}</section>`).join("")}</div>` : '<div class="diff-empty">两个明确快照之间没有资产内容差异。</div>'}`;
+        return `<div class="diff-summary"><span class="mono">${esc(shortSha(diff.from_commit))}</span><span>→</span><span class="mono">${esc(diff.to_commit || "工作区")}</span><span class="badge">${files.length} 个变化文件</span></div>${files.length ? `<div class="diff-files">${files.map(file => `<section class="diff-file"><div class="diff-file-head"><span class="badge ${file.change === "removed" ? "error" : file.change === "added" ? "success" : "warn"}">${esc(changeLabels[file.change] || file.change)}</span><span class="diff-path mono">${esc(displayPath(file.path))}</span>${file.binary ? '<span class="badge warn">二进制</span>' : ""}</div>${file.binary ? `<div class="binary-note">二进制文件已变化，不生成文本差异。</div>` : file.text_diff ? `<pre class="diff-text">${file.text_diff.replace(/\n$/, "").split("\n").map(line => `<span class="diff-line ${line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : line.startsWith("@@") ? "hunk" : ""}">${esc(line)}</span>`).join("")}</pre>` : '<div class="binary-note">无可用文本差异。</div>'}</section>`).join("")}</div>` : '<div class="diff-empty">两个明确快照之间没有资产内容差异。</div>'}`;
       }
 
       function renderDiffPanel() {
@@ -416,7 +410,8 @@
       }
 
       function distributionRevisionOptions(selected, defaultRevision) {
-        const revisions = [{value:defaultRevision,label:`默认发布通道 · ${defaultRevision}`},{value:"HEAD",label:"HEAD · 最新提交"}];
+        const revisions = [{value:defaultRevision,label:defaultRevision === "HEAD" ? "默认回退 · HEAD 最新提交" : `默认发布通道 · ${defaultRevision}`}];
+        if (defaultRevision !== "HEAD") revisions.push({value:"HEAD",label:"HEAD · 最新提交"});
         state.version.tags.forEach(tag => {
           if (!revisions.some(item => item.value === tag.full_name)) revisions.push({value:tag.full_name,label:`${tag.name} · ${shortSha(tag.commit)}`});
         });
@@ -444,7 +439,7 @@
         if (!execution) return "";
         const completed = execution.status === "completed";
         const statusLabels = {written:"已写入",unchanged:"未变化",failed:"失败",skipped:"已跳过"};
-        return `<div class="distribution-plan-head"><div class="inline-notice ${completed ? "" : "error"}">${icon(completed ? "check" : "error")}<div><strong>${completed ? "分发已完成" : "分发未完成"}</strong><br>来源 commit：<span class="mono">${esc(distribution.plan.commit)}</span>${completed ? "<br>目标清单已更新；不会执行 Skill 脚本。" : "<br>已处理、失败和跳过项如下。修复目标问题后请重新生成计划，不直接复用失败计划。"}</div></div></div><div class="distribution-plan-list">${execution.files.map(file => `<div class="distribution-plan-item"><div class="distribution-plan-line"><span class="badge ${file.status === "failed" ? "error" : file.status === "skipped" ? "warn" : "success"}">${esc(statusLabels[file.status] || file.status)}</span><span class="distribution-plan-path mono">${esc(file.target_path)}</span></div>${file.error ? `<div class="distribution-result-error">${esc(file.error.code)} · ${esc(file.error.reason)}<br>${esc(file.error.suggestion)}</div>` : ""}</div>`).join("")}</div><div class="distribution-actions"><button type="button" class="btn" data-action="${completed ? "replan-distribution" : "retry-distribution"}">${icon("refresh")}${completed ? "重新预览当前输入" : "重新生成计划并安全重试"}</button></div>`;
+        return `<div class="distribution-plan-head"><div class="inline-notice ${completed ? "" : "error"}">${icon(completed ? "check" : "error")}<div><strong>${completed ? "分发已完成" : "分发未完成"}</strong><br>来源 commit：<span class="mono">${esc(distribution.plan.commit)}</span>${completed ? "<br>目标清单已更新；不会执行 Skill 脚本。" : "<br>已处理、失败和跳过项如下。修复目标问题后请重新生成计划，不直接复用失败计划。"}</div></div></div><div class="distribution-plan-list">${execution.files.map(file => `<div class="distribution-plan-item"><div class="distribution-plan-line"><span class="badge ${file.status === "failed" ? "error" : file.status === "skipped" ? "warn" : "success"}">${esc(statusLabels[file.status] || file.status)}</span><span class="distribution-plan-path mono">${esc(displayPath(file.target_path))}</span></div>${file.error ? `<div class="distribution-result-error">${esc(file.error.code)} · ${esc(file.error.reason)}<br>${esc(file.error.suggestion)}</div>` : ""}</div>`).join("")}</div><div class="distribution-actions"><button type="button" class="btn" data-action="${completed ? "replan-distribution" : "retry-distribution"}">${icon("refresh")}${completed ? "重新预览当前输入" : "重新生成计划并安全重试"}</button></div>`;
       }
 
       function renderDistributionPlan(distribution) {
@@ -461,7 +456,7 @@
         let guidance = "";
         if (unmanaged) guidance = `<div class="distribution-body"><div class="inline-notice error">${icon("error")}<div><strong>未纳管冲突不可覆盖</strong><br>请先备份、移动或移除对应目标路径，再重新 dry-run。显式覆盖选项不会放开此类冲突。</div></div></div>`;
         else if (managed && blocked) guidance = `<div class="distribution-body"><label class="checkbox-field"><input type="checkbox" data-distribution-field="overwriteManaged" ${distribution.overwriteManaged ? "checked" : ""} ${distribution.executing ? "disabled" : ""}><span><strong>我确认覆盖上述已纳管文件的本地修改</strong><br>请先备份需要保留的内容。勾选后还需重新 dry-run，生成可执行的新计划。</span></label>${distribution.overwriteManaged ? '<div class="inline-notice warn" style="margin-top:10px">'+icon("info")+'<div>覆盖确认仅用于下一次计划；请点击“重新 dry-run”检查更新后的状态。</div></div>' : ""}</div>`;
-        return `<div class="distribution-plan-head"><div class="summary-list"><div class="summary-row"><span>计划状态</span><span class="badge ${blocked ? "error" : "success"}">${blocked ? "存在阻塞冲突" : "可执行"}</span></div><div class="summary-row"><span>来源 revision</span><span class="mono">${esc(distributionRevisionLabel(plan.source))}</span></div><div class="summary-row"><span>来源 commit</span><span class="mono">${esc(plan.commit)}</span></div><div class="summary-row"><span>目标根目录</span><span class="mono">${esc(plan.target_root)}</span></div><div class="summary-row"><span>适配器</span><span class="mono">${esc(plan.adapter_version)}</span></div></div></div><div class="distribution-plan-list">${plan.files.map(file => `<div class="distribution-plan-item"><div class="distribution-plan-line"><span class="badge ${file.status === "conflict" ? "error" : file.status === "updated" ? "warn" : file.status === "added" ? "success" : ""}">${esc(statusLabels[file.status] || file.status)}</span><span class="distribution-plan-path mono">${esc(file.target_path)}</span></div><div class="distribution-plan-meta"><span class="mono">sha256:${esc(file.checksum)}</span>${file.conflict ? `<span>${esc(conflictLabels[file.conflict] || file.conflict)}</span>` : ""}</div></div>`).join("")}</div>${guidance}${!blocked ? `<div class="distribution-actions"><button type="button" class="btn primary" data-action="execute-distribution" ${distribution.executing ? "disabled" : ""}>${icon("distribute")}${distribution.executing ? "正在执行…" : "确认执行分发"}</button><button type="button" class="btn" data-action="replan-distribution" ${distribution.executing ? "disabled" : ""}>重新 dry-run</button></div>` : ""}`;
+        return `<div class="distribution-plan-head"><div class="summary-list"><div class="summary-row"><span>计划状态</span><span class="badge ${blocked ? "error" : "success"}">${blocked ? "存在阻塞冲突" : "可执行"}</span></div><div class="summary-row"><span>来源 revision</span><span class="mono">${esc(distributionRevisionLabel(plan.source))}</span></div><div class="summary-row"><span>来源 commit</span><span class="mono">${esc(plan.commit)}</span></div><div class="summary-row"><span>目标根目录</span><span class="mono">${esc(displayPath(plan.target_root))}</span></div><div class="summary-row"><span>适配器</span><span class="mono">${esc(plan.adapter_version)}</span></div></div></div><div class="distribution-plan-list">${plan.files.map(file => `<div class="distribution-plan-item"><div class="distribution-plan-line"><span class="badge ${file.status === "conflict" ? "error" : file.status === "updated" ? "warn" : file.status === "added" ? "success" : ""}">${esc(statusLabels[file.status] || file.status)}</span><span class="distribution-plan-path mono">${esc(displayPath(file.target_path))}</span></div><div class="distribution-plan-meta"><span class="mono">sha256:${esc(file.checksum)}</span>${file.conflict ? `<span>${esc(conflictLabels[file.conflict] || file.conflict)}</span>` : ""}</div></div>`).join("")}</div>${guidance}${!blocked ? `<div class="distribution-actions"><button type="button" class="btn primary" data-action="execute-distribution" ${distribution.executing ? "disabled" : ""}>${icon("distribute")}${distribution.executing ? "正在执行…" : "确认执行分发"}</button><button type="button" class="btn" data-action="replan-distribution" ${distribution.executing ? "disabled" : ""}>重新 dry-run</button></div>` : ""}`;
       }
 
       function renderDistribution() {
@@ -471,14 +466,22 @@
         const reference = assetRef(asset);
         const distribution = state.distribution;
         const options = distribution.options;
+        const standard = distribution.mode !== "custom";
         const disabled = distribution.planLoading || distribution.executing ? "disabled" : "";
         const targets = options && Array.isArray(options.targets) ? options.targets : [];
+        const selectedTarget = targets.find(target => target.target === distribution.target) || null;
         const assetOptions = state.entries.filter(item => item.asset).map(item => `<option value="${esc(item.key)}" ${item.key === state.selectedKey ? "selected" : ""}>${esc(assetRef(item.asset))} · ${esc(item.asset.metadata.title)}</option>`).join("");
-        const targetOptions = targets.map(target => `<option value="${esc(target.target)}" ${distribution.target === target.target ? "selected" : ""}>${esc(target.target)} · ${esc(target.root)}</option>`).join("");
+        const targetOptions = targets.map(target => `<option value="${esc(target.target)}" ${distribution.target === target.target ? "selected" : ""}>${esc(target.target)}</option>`).join("");
         const defaultRevision = options ? options.default_revision : `adock/${reference.replace(":", "/")}/prod`;
         const actions = `<button type="button" class="btn" data-action="nav" data-view="history">${icon("history")}查看历史与标签</button>`;
-        const optionsState = distribution.optionsLoading ? '<div class="inline-notice"><span class="spinner" style="width:13px;height:13px"></span><div>正在读取目标配置…</div></div>' : distribution.optionsError ? `${errorNotice(distribution.optionsError)}<button type="button" class="btn small" data-action="retry-distribution-options">重试读取目标</button>` : !targets.length ? '<div class="inline-notice warn">'+icon("info")+'<div>当前资产没有已配置且受支持的目标组合。请在 adock.yaml 或 adock.local.yaml 中配置 TargetProfile。</div></div>' : "";
-        return pageHead("安全分发",`当前资产 ${reference} · 默认使用 prod，也可显式选择 HEAD、commit 或版本标签。`,actions) + `<div class="distribution-grid"><section class="card distribution-card"><div class="history-card-head"><h2>1. 选择分发输入</h2><span class="soft">Git 快照 · 不切换分支</span></div><div class="distribution-body"><form id="distribution-form" class="distribution-form"><div class="field"><label for="distribution-asset">资产</label><select id="distribution-asset" data-distribution-field="asset" ${disabled}>${assetOptions}</select></div><div class="field"><label for="distribution-target">目标工具</label><select id="distribution-target" data-distribution-field="target" ${disabled || !targets.length ? "disabled" : ""}>${targetOptions}</select><small>仅列出配置中存在且支持当前资产类型的目标。</small></div><div class="field"><label for="distribution-revision">来源 revision</label><select id="distribution-revision" data-distribution-field="revision" ${disabled}>${distributionRevisionOptions(distribution.revision || defaultRevision, defaultRevision)}</select><small>分发只允许可追溯的已提交快照，不提供 working-tree。</small></div>${renderDistributionVariables(asset, distribution)}${optionsState}<button type="submit" class="btn primary" ${disabled || !distribution.target ? "disabled" : ""}>${icon("check")}${distribution.planLoading ? "正在生成计划…" : "dry-run 预览分发计划"}</button></form></div></section><section class="card distribution-card"><div class="history-card-head"><h2>2. 核对计划与结果</h2><span class="soft">同一份计划用于预览与确认</span></div>${renderDistributionPlan(distribution)}</section></div>`;
+        const traeEditions = standard && distribution.scope === "user" && distribution.target === "trae" && options && Array.isArray(options.trae_edition_options) ? options.trae_edition_options : [];
+        const requiresTraeEdition = traeEditions.length > 1 && !distribution.traeEdition;
+        const traeEditionField = traeEditions.length > 1 ? `<div class="field"><label for="distribution-trae-edition">Trae 版本</label><select id="distribution-trae-edition" data-distribution-field="traeEdition" ${disabled}><option value="">请选择要分发到的版本</option><option value="cn" ${distribution.traeEdition === "cn" ? "selected" : ""}>Trae CN</option><option value="international" ${distribution.traeEdition === "international" ? "selected" : ""}>Trae 国际版</option></select><small>同时检测到两个用户目录，选择后将重新解析目标位置。</small></div>` : "";
+        const scopeSelector = `<div class="field"><label>作用范围</label><div class="detail-actions"><button type="button" class="btn small ${standard && distribution.scope === "project" ? "primary" : ""}" data-action="set-distribution-scope" data-scope="project" ${disabled}>当前项目</button><button type="button" class="btn small ${standard && distribution.scope === "user" ? "primary" : ""}" data-action="set-distribution-scope" data-scope="user" ${disabled}>用户级</button><button type="button" class="btn small ${standard ? "" : "primary"}" data-action="${standard ? "advanced-distribution" : "configure-target"}" ${disabled || !options ? "disabled" : ""}>${standard ? "高级自定义" : "管理自定义"}</button></div><small>${standard ? (distribution.scope === "project" ? "写入当前工作区的官方项目目录。" : "写入当前用户的官方工具目录。") : "正在使用高级自定义目录；点击项目级或用户级即可恢复自动解析。"}</small></div>`;
+        const locationText = !selectedTarget ? "选择目标工具后自动计算" : requiresTraeEdition ? "选择 Trae 版本后自动确定" : displayPath(selectedTarget.root);
+        const locationNotice = `<div class="recent-path"><strong>${standard ? "自动目标位置（只读）" : "自定义目标位置"}</strong><span class="mono">${esc(locationText)}</span></div>`;
+        const optionsState = distribution.optionsLoading ? '<div class="inline-notice"><span class="spinner" style="width:13px;height:13px"></span><div>正在解析工具目录…</div></div>' : distribution.optionsError ? `${errorNotice(distribution.optionsError)}<button type="button" class="btn small" data-action="retry-distribution-options">重试解析目标</button>` : !targets.length ? `<div class="inline-notice warn">${icon("info")}<div><strong>${standard ? "当前资产没有受支持的目标工具" : "高级模式还没有可用的自定义目录"}</strong>${standard ? "" : '<br>可添加自定义目录，或返回项目级/用户级自动分发。'}<div class="detail-actions"><button type="button" class="btn small" data-action="configure-target">高级自定义</button></div></div></div>` : "";
+        return pageHead("安全分发",`当前资产 ${reference} · 选择 AI 工具与作用范围即可自动解析目录，无需前置配置。`,actions) + `<div class="distribution-grid"><section class="card distribution-card"><div class="history-card-head"><h2>1. 选择分发输入</h2><span class="soft">Git 快照 · 不切换分支</span></div><div class="distribution-body">${options && options.default_revision_fallback ? '<div class="inline-notice warn">'+icon("info")+'<div>当前资产的默认发布通道尚未创建，本次默认使用 HEAD；不会自动创建或移动发布标签。</div></div>' : ""}<form id="distribution-form" class="distribution-form"><div class="field"><label for="distribution-asset">资产</label><select id="distribution-asset" data-distribution-field="asset" ${disabled}>${assetOptions}</select></div><div class="field"><label for="distribution-target">目标 AI 工具</label><select id="distribution-target" data-distribution-field="target" ${disabled || !targets.length ? "disabled" : ""}>${targetOptions}</select><small>${standard ? "列出支持当前资产类型的工具，无需配置目录。" : "仅列出已有配置且支持当前资产的自定义目标。"}</small></div>${scopeSelector}${traeEditionField}${locationNotice}<div class="field"><label for="distribution-revision">来源 revision</label><select id="distribution-revision" data-distribution-field="revision" ${disabled}>${distributionRevisionOptions(distribution.revision || defaultRevision, defaultRevision)}</select><small>分发只允许可追溯的已提交快照，不提供 working-tree。</small></div>${renderDistributionVariables(asset, distribution)}${optionsState}<button type="submit" class="btn primary" ${disabled || distribution.optionsLoading || !options || !distribution.target || requiresTraeEdition ? "disabled" : ""}>${icon("check")}${distribution.planLoading ? "正在生成计划…" : "dry-run 预览分发计划"}</button></form></div></section><section class="card distribution-card"><div class="history-card-head"><h2>2. 核对计划与结果</h2><span class="soft">同一份计划用于预览与确认</span></div>${renderDistributionPlan(distribution)}</section></div>`;
       }
 
       function renderCollab() {
@@ -489,21 +492,21 @@
             owners.get(String(owner)).push(assetRef(asset));
           });
         });
-        const root = state.workspace ? state.workspace.root : state.currentPath || "打开工作区后显示仓库路径";
-        return pageHead("协作说明","从统一入口找到资产规范、负责人和评审路径。协作状态仍由 Git 平台管理。",'<button type="button" class="btn" data-action="nav" data-view="assets" aria-label="返回资产页面">返回资产</button>') + `<div class="collab-grid"><section class="card collab-card"><h2>新成员从这里开始</h2><p>以下是当前工作区内的规范入口位置。本轮仅提供协作说明，不伪造打开仓库文档的后端操作。</p><div class="doc-links"><div class="doc-link">${icon("file")}README · 团队统一入口<span class="mono">README.md</span></div><div class="doc-link">${icon("folder")}Prompt 目录与模板规范<span class="mono">prompts/</span></div><div class="doc-link">${icon("folder")}Skill 目录与资源规范<span class="mono">skills/</span></div><div class="doc-link">${icon("check")}Schema 与工作区校验<span class="mono">schemas/</span></div><div class="doc-link">${icon("file")}评审负责人配置<span class="mono">CODEOWNERS</span></div></div><div class="disabled-feature"><strong>当前边界</strong><br>MCP 注册与 Eval 不在当前 MVP 范围。本页面不提供不可用操作入口。</div></section><section class="card collab-card"><h2>资产负责人</h2><p>owners 来自当前真实资产元数据；CODEOWNERS 与合并权限由 Git 平台执行。</p>${owners.size ? [...owners.entries()].map(([owner,refs]) => `<div class="owner-row"><span class="mono">${esc(refs.join(" · "))}</span><strong>${esc(owner)}</strong></div>`).join("") : '<div class="muted">打开包含资产的工作区后，这里会显示负责人。</div>'}<div class="inline-notice" style="margin-top:16px">${icon("info")}<div>AgentDock 提供校验和资产详情，不复制 MR/PR 的评审状态。</div></div></section><section class="card collab-card wide" style="grid-column:1/-1"><h2>标准变更流程</h2><p>所有资产修改通过同一 Git 评审路径进入仓库；刷新后桌面端直接读取最新事实源。</p><div class="flow"><span class="flow-node">修改资产</span><span class="flow-arrow">→</span><span class="flow-node">本地校验</span><span class="flow-arrow">→</span><span class="flow-node">提交 MR / PR</span><span class="flow-arrow">→</span><span class="flow-node">负责人评审合并</span><span class="flow-arrow">→</span><span class="flow-node">刷新工作区</span></div><div class="recent-path"><strong>当前工作区</strong><span class="mono">${esc(root)}</span></div></section></div>`;
+        const root = state.workspace ? displayPath(state.workspace.root) : displayPath(state.currentPath) || "打开工作区后显示仓库路径";
+        return pageHead("协作说明","从统一入口找到资产规范、负责人和评审路径。协作状态仍由 Git 平台管理。",'<button type="button" class="btn" data-action="nav" data-view="assets" aria-label="返回资产页面">返回资产</button>') + `<div class="collab-grid"><section class="card collab-card"><h2>新成员从这里开始</h2><p>以下是当前工作区内的规范入口位置。本轮仅提供协作说明，不伪造打开仓库文档的后端操作。</p><div class="doc-links"><div class="doc-link">${icon("file")}README · 团队统一入口<span class="mono">README.md</span></div><div class="doc-link">${icon("folder")}Prompt 目录与模板规范<span class="mono">prompts/</span></div><div class="doc-link">${icon("folder")}Skill 目录与资源规范<span class="mono">skills/</span></div><div class="doc-link">${icon("check")}Schema 与工作区校验<span class="mono">schemas/</span></div><div class="doc-link">${icon("file")}评审负责人配置<span class="mono">CODEOWNERS</span></div></div><div class="disabled-feature"><strong>当前边界</strong><br>MCP 注册与 Eval 不在当前 MVP 范围。本页面不提供不可用操作入口。</div></section><section class="card collab-card"><h2>资产负责人</h2><p>owners 来自当前真实资产元数据；CODEOWNERS 与合并权限由 Git 平台执行。</p>${owners.size ? [...owners.entries()].map(([owner,refs]) => `<div class="owner-row"><span class="mono">${esc(refs.join(" · "))}</span><strong>${esc(owner)}</strong></div>`).join("") : '<div class="muted">打开包含资产的工作区后，这里会显示负责人。</div>'}<div class="inline-notice" style="margin-top:16px">${icon("info")}<div>AgentDock 提供校验和资产详情，不复制 MR/PR 的评审状态。</div></div></section><section class="card collab-card wide" style="grid-column:1/-1"><h2>标准变更流程</h2><p>所有资产修改通过同一 Git 评审路径进入仓库；刷新后桌面端直接读取最新事实源。</p><div class="flow"><span class="flow-node">修改资产</span><span class="flow-arrow">→</span><span class="flow-node">本地校验</span><span class="flow-arrow">→</span><span class="flow-node">提交 MR / PR</span><span class="flow-arrow">→</span><span class="flow-node">负责人评审合并</span><span class="flow-arrow">→</span><span class="flow-node">刷新工作区</span></div><div class="recent-path"><strong>当前工作区</strong><span class="mono">${esc(displayPath(root))}</span></div></section></div>`;
       }
 
       function render() {
         renderChrome();
         let content;
         if (state.view === "collab") content = renderCollab();
-        else if (state.view === "distribute" && state.workspace && !state.workspaceError && !state.assetsError && !(state.assetsLoaded && state.entries.length === 0)) content = renderDistribution();
-        else if (state.loadingWorkspace && !state.workspace) content = loadingState("正在打开工作区", state.currentPath || "正在定位仓库与配置");
-        else if (state.view === "history" && state.workspace && !state.workspaceError && !state.assetsError && !(state.assetsLoaded && state.entries.length === 0)) content = renderHistory();
+        else if (state.view === "distribute" && state.workspace && !state.workspaceError && !state.assetsError && !(state.assetsLoaded && state.allEntries.length === 0)) content = renderDistribution();
+        else if (state.loadingWorkspace && !state.workspace) content = loadingState("正在打开工作区", state.currentPath ? displayPath(state.currentPath) : "正在定位仓库与配置");
+        else if (state.view === "history" && state.workspace && !state.workspaceError && !state.assetsError && !(state.assetsLoaded && state.allEntries.length === 0)) content = renderHistory();
         else if (state.workspaceError) content = renderWorkspaceError();
         else if (!state.workspace) content = renderWelcome();
         else if (state.assetsError) content = renderAssetsError();
-        else if (state.assetsLoaded && state.entries.length === 0) content = renderEmptyWorkspace();
+        else if (state.assetsLoaded && state.allEntries.length === 0) content = renderEmptyWorkspace();
         else content = renderAssets();
         $("#main").innerHTML = `<div class="page">${content}</div>`;
         $("#main").setAttribute("aria-busy", String(state.loadingWorkspace || state.loadingAssets || state.detailLoading));
@@ -529,7 +532,7 @@
         distributionOptionsEpoch += 1;
         state.distribution = {
           ref: null, options: null, optionsLoading: false, optionsError: null,
-          target: "", revision: "", variables: {}, overwriteManaged: false,
+          mode: "standard", scope: "project", traeEdition: null, target: "", revision: "", variables: {}, overwriteManaged: false,
           plan: null, planLoading: false, planError: null,
           executing: false, execution: null, executionError: null
         };
@@ -570,6 +573,7 @@
         detailEpoch += 1;
         resetVersionContext();
         state.entries = [];
+        state.allEntries = [];
         state.assetsLoaded = false;
         state.assetsError = null;
         state.selectedKey = null;
@@ -725,15 +729,20 @@
         const reference = assetRef(entry.asset);
         if (state.distribution.ref !== reference) resetDistributionContext();
         state.distribution.ref = reference;
+        const mode = state.distribution.mode;
+        const scope = state.distribution.scope;
+        const traeEdition = state.distribution.traeEdition;
+        const command = mode === "custom" ? "get_distribution_options" : "get_scoped_distribution_options";
+        const args = mode === "custom" ? {path:root,reference} : {path:root,reference,scope,traeEdition};
         const epoch = ++distributionOptionsEpoch;
         state.distribution.optionsLoading = true;
         state.distribution.optionsError = null;
         render();
         try {
-          const options = await invoke("get_distribution_options", {path:root,reference});
-          if (epoch !== distributionOptionsEpoch || state.distribution.ref !== reference || !state.workspace || state.workspace.root !== root) return;
-          if (!options || !Array.isArray(options.targets) || typeof options.default_revision !== "string") {
-            throw {code:"invalid_contract",operation:"get_distribution_options",subject:reference,reason:"目标命令未返回 default_revision 与 targets。",suggestion:"请检查桌面分发 DTO。"};
+          const options = await invoke(command, args);
+          if (epoch !== distributionOptionsEpoch || state.distribution.ref !== reference || state.distribution.mode !== mode || state.distribution.scope !== scope || state.distribution.traeEdition !== traeEdition || !state.workspace || state.workspace.root !== root) return;
+          if (!options || !Array.isArray(options.targets) || !Array.isArray(options.supported_targets) || typeof options.default_revision !== "string") {
+            throw {code:"invalid_contract",operation:command,subject:reference,reason:"目标命令未返回 default_revision、targets 与 supported_targets。",suggestion:"请检查桌面分发 DTO。"};
           }
           state.distribution.options = options;
           if (!options.targets.some(target => target.target === state.distribution.target)) state.distribution.target = options.targets.length ? options.targets[0].target : "";
@@ -743,7 +752,7 @@
         } catch (error) {
           if (epoch !== distributionOptionsEpoch) return;
           state.distribution.optionsLoading = false;
-          state.distribution.optionsError = normalizeError(error, "get_distribution_options", reference);
+          state.distribution.optionsError = normalizeError(error, command, reference);
           render();
         }
       }
@@ -758,17 +767,71 @@
         loadDistributionOptions(entry);
       }
 
+      async function openAdvancedDistribution() {
+        const entry = selectedEntry();
+        const context = currentAssetContext();
+        if (!entry || !entry.asset || !context) return;
+        invalidateDistributionResults();
+        state.distribution.mode = "custom";
+        state.distribution.traeEdition = null;
+        state.distribution.options = null;
+        state.distribution.optionsError = null;
+        await loadDistributionOptions(entry);
+        const current = currentAssetContext();
+        if (!current || current.root !== context.root || current.reference !== context.reference || state.distribution.mode !== "custom" || state.distribution.optionsLoading || !state.distribution.options) return;
+        openTargetConfigModal();
+      }
+
+      function setDistributionScope(scope) {
+        const entry = selectedEntry();
+        if (!entry || !entry.asset || !["project","user"].includes(scope)) return;
+        if (state.distribution.mode === "standard" && state.distribution.scope === scope) return;
+        invalidateDistributionResults();
+        state.distribution.mode = "standard";
+        state.distribution.scope = scope;
+        state.distribution.traeEdition = null;
+        state.distribution.options = null;
+        state.distribution.optionsError = null;
+        loadDistributionOptions(entry);
+      }
+
+      function setDistributionTraeEdition(edition) {
+        const entry = selectedEntry();
+        if (!entry || !entry.asset || !["","cn","international"].includes(edition)) return;
+        invalidateDistributionResults();
+        state.distribution.traeEdition = edition || null;
+        state.distribution.options = null;
+        state.distribution.optionsError = null;
+        loadDistributionOptions(entry);
+      }
+
       async function previewDistribution() {
         const entry = selectedEntry();
         if (!state.workspace || !entry || !entry.asset || state.distribution.planLoading || state.distribution.executing) return;
         const distribution = state.distribution;
         const reference = assetRef(entry.asset);
+        if (distribution.optionsLoading || !distribution.options) return;
         if (!distribution.target) {
-          distribution.planError = normalizeError({code:"invalid_input",operation:"desktop.distribution.preview",subject:reference,reason:"尚未选择可用目标工具。",suggestion:"请先配置并选择支持当前资产类型的 TargetProfile。"});
+          distribution.planError = normalizeError({code:"invalid_input",operation:"desktop.distribution.preview",subject:reference,reason:"尚未选择可用目标工具。",suggestion:"请选择支持当前资产类型的目标工具。"});
+          render();
+          return;
+        }
+        if (distribution.mode === "standard" && distribution.scope === "user" && distribution.target === "trae" && distribution.options && distribution.options.trae_edition_options && distribution.options.trae_edition_options.length > 1 && !distribution.traeEdition) {
+          distribution.planError = normalizeError({code:"invalid_input",operation:"desktop.distribution.preview",subject:reference,reason:"同时检测到 Trae CN 与国际版用户目录。",suggestion:"请先选择要分发到的 Trae 版本。"});
           render();
           return;
         }
         const root = state.workspace.root;
+        const command = distribution.mode === "custom" ? "preview_distribution" : "preview_scoped_distribution";
+        const args = {
+          path:root, reference, target:distribution.target,
+          revision:distribution.revision || null,
+          variables:{...distribution.variables}, overwriteManaged:distribution.overwriteManaged
+        };
+        if (distribution.mode === "standard") {
+          args.scope = distribution.scope;
+          args.traeEdition = distribution.traeEdition;
+        }
         const epoch = ++distributionEpoch;
         distribution.plan = null;
         distribution.planError = null;
@@ -777,14 +840,10 @@
         distribution.planLoading = true;
         render();
         try {
-          const plan = await invoke("preview_distribution", {
-            path:root, reference, target:distribution.target,
-            revision:distribution.revision || null,
-            variables:{...distribution.variables}, overwriteManaged:distribution.overwriteManaged
-          });
+          const plan = await invoke(command, args);
           if (epoch !== distributionEpoch || distribution.ref !== reference) return;
           if (!plan || !Array.isArray(plan.files) || typeof plan.commit !== "string") {
-            throw {code:"invalid_contract",operation:"preview_distribution",subject:reference,reason:"dry-run 未返回有效的 commit 与 files。",suggestion:"请检查 DistributionPlan serde 契约。"};
+            throw {code:"invalid_contract",operation:command,subject:reference,reason:"dry-run 未返回有效的 commit 与 files。",suggestion:"请检查 DistributionPlan serde 契约。"};
           }
           distribution.plan = plan;
           distribution.planLoading = false;
@@ -792,7 +851,7 @@
         } catch (error) {
           if (epoch !== distributionEpoch) return;
           distribution.planLoading = false;
-          distribution.planError = normalizeError(error, "preview_distribution", reference);
+          distribution.planError = normalizeError(error, command, reference);
           render();
         }
       }
@@ -823,21 +882,47 @@
         }
       }
 
+      function coreAssetFilter() {
+        return {
+          kind: state.filters.kind === "all" ? null : state.filters.kind,
+          owner: state.filters.owner === "all" ? null : state.filters.owner,
+          label: state.filters.label === "all" ? null : state.filters.label,
+          query: state.filters.search.trim() || null
+        };
+      }
+
+      function scheduleAssetFilter() {
+        assetsEpoch += 1;
+        clearTimeout(filterTimer);
+        filterTimer = setTimeout(() => {
+          if (state.workspace) loadAssets(true);
+        }, 150);
+      }
+
       async function loadAssets(preserveSelection = false) {
         if (!state.workspace) return;
+        clearTimeout(filterTimer);
+        filterTimer = null;
         const root = state.workspace.root;
         const epoch = workspaceEpoch;
+        const requestEpoch = ++assetsEpoch;
         const previousRef = preserveSelection && selectedEntry() && selectedEntry().asset ? assetRef(selectedEntry().asset) : null;
+        const filter = coreAssetFilter();
+        const filtered = hasFilters();
         resetDistributionContext();
         state.loadingAssets = true;
         state.assetsError = null;
         if (!preserveSelection) clearContext(false);
         render();
         try {
-          const result = await invoke("list_assets", {path:root});
-          if (epoch !== workspaceEpoch || !state.workspace || state.workspace.root !== root) return;
+          const [result, allResult] = await Promise.all([
+            invoke("list_assets", {path:root, filter}),
+            filtered ? invoke("list_assets", {path:root, filter:{kind:null,owner:null,label:null,query:null}}) : Promise.resolve(null)
+          ]);
+          if (epoch !== workspaceEpoch || requestEpoch !== assetsEpoch || !state.workspace || state.workspace.root !== root) return;
           const entries = normalizeEntries(result);
           state.entries = entries;
+          state.allEntries = allResult ? normalizeEntries(allResult) : entries;
           state.assetsLoaded = true;
           state.loadingAssets = false;
           let next = previousRef ? entries.find(entry => entry.asset && assetRef(entry.asset) === previousRef) : null;
@@ -849,11 +934,12 @@
           if (next) await Promise.all([loadDetail(next), loadAssetHistory(next)]);
           if (next && state.view === "distribute") loadDistributionOptions(next);
         } catch (error) {
-          if (epoch !== workspaceEpoch) return;
+          if (epoch !== workspaceEpoch || requestEpoch !== assetsEpoch) return;
           state.loadingAssets = false;
           state.assetsLoaded = false;
           state.assetsError = normalizeError(error, "list_assets", root);
           state.entries = [];
+          state.allEntries = [];
           state.selectedKey = null;
           state.detail = null;
           state.detailError = null;
@@ -962,20 +1048,20 @@
 
       function openWorkspaceModal() {
         const path = state.currentPath || recentPath;
-        openModal(modalHead("打开或初始化工作区","工作区直接读取 Git 资产仓库，不创建桌面私有资产副本。") + `<form id="open-workspace-form"><div class="modal-body"><div class="field"><label for="open-workspace-path">工作区路径</label><input class="mono" id="open-workspace-path" name="path" value="${esc(path)}" placeholder="例如 D:\\team\\agent-dock-assets" aria-label="要打开的工作区路径" required autocomplete="off"><small>将从该目录向上查找 adock.yaml，并检查仓库与配置状态。</small></div>${recentPath ? `<div class="recent-path"><strong>最近使用</strong><span class="mono">${esc(recentPath)}</span></div>` : ""}<div class="inline-notice" style="margin-top:15px">${icon("git")}<div>共享配置与本机覆盖配置由 Core 按固定优先级合并；本机路径不会写回共享文件。</div></div>${state.workspace ? `<div class="recent-path" style="margin-top:15px"><strong>当前配置</strong><span class="mono">${esc(state.workspace.config_path)}</span></div>` : ""}<div class="modal-error"></div></div><div class="modal-foot"><button type="button" class="btn ghost" data-action="cancel-open" aria-label="取消打开工作区">取消</button><button type="button" class="btn" data-action="init-from-open" aria-label="转为初始化新工作区">初始化新工作区</button><button type="submit" class="btn primary" aria-label="打开指定工作区">打开工作区</button></div></form>`, {kind:"open"});
+        openModal(modalHead("打开或初始化工作区","工作区直接读取 Git 资产仓库，不创建桌面私有资产副本。") + `<form id="open-workspace-form"><div class="modal-body"><div class="field"><label for="open-workspace-path">工作区路径</label><input class="mono" id="open-workspace-path" name="path" value="${esc(displayPath(path))}" placeholder="例如 D:\\team\\agent-dock-assets" aria-label="要打开的工作区路径" required autocomplete="off"><small>将从该目录向上查找 adock.yaml，并检查仓库与配置状态。</small></div>${recentPath ? `<div class="recent-path"><strong>最近使用</strong><span class="mono">${esc(displayPath(recentPath))}</span></div>` : ""}<div class="inline-notice" style="margin-top:15px">${icon("git")}<div>共享配置与本机覆盖配置由 Core 按固定优先级合并；本机路径不会写回共享文件。</div></div>${state.workspace ? `<div class="recent-path" style="margin-top:15px"><strong>当前配置</strong><span class="mono">${esc(displayPath(state.workspace.config_path))}</span></div>` : ""}<div class="modal-error"></div></div><div class="modal-foot"><button type="button" class="btn ghost" data-action="cancel-open" aria-label="取消打开工作区">取消</button><button type="button" class="btn" data-action="init-from-open" aria-label="转为初始化新工作区">初始化新工作区</button><button type="submit" class="btn primary" aria-label="打开指定工作区">打开工作区</button></div></form>`, {kind:"open"});
       }
 
       function openInitModal(path = "") {
-        openModal(modalHead("初始化新工作区","先选择空目录，下一步会展示创建范围并再次确认。") + `<form id="init-path-form"><div class="modal-body"><div class="field"><label for="init-workspace-path">空目录路径</label><input class="mono" id="init-workspace-path" name="path" value="${esc(path)}" placeholder="例如 D:\\team\\new-assets" aria-label="要初始化的空目录路径" required autocomplete="off"><small>已有非空目录不会被静默覆盖，最终安全检查由初始化命令执行。</small></div><div class="inline-notice warn">${icon("info")}<div>此步骤不会写入文件。只有下一步明确确认后，才会调用初始化命令。</div></div><div class="modal-error"></div></div><div class="modal-foot"><button type="button" class="btn" data-action="cancel-init" aria-label="取消初始化工作区">取消</button><button type="submit" class="btn primary" aria-label="继续确认初始化范围">继续</button></div></form>`, {kind:"init-path"});
+        openModal(modalHead("初始化新工作区","先选择空目录，下一步会展示创建范围并再次确认。") + `<form id="init-path-form"><div class="modal-body"><div class="field"><label for="init-workspace-path">空目录路径</label><input class="mono" id="init-workspace-path" name="path" value="${esc(displayPath(path))}" placeholder="例如 D:\\team\\new-assets" aria-label="要初始化的空目录路径" required autocomplete="off"><small>已有非空目录不会被静默覆盖，最终安全检查由初始化命令执行。</small></div><div class="inline-notice warn">${icon("info")}<div>此步骤不会写入文件。只有下一步明确确认后，才会调用初始化命令。</div></div><div class="modal-error"></div></div><div class="modal-foot"><button type="button" class="btn" data-action="cancel-init" aria-label="取消初始化工作区">取消</button><button type="submit" class="btn primary" aria-label="继续确认初始化范围">继续</button></div></form>`, {kind:"init-path"});
       }
 
       function openInitConfirm(path) {
-        openModal(modalHead("确认初始化工作区","请核对目标目录与创建范围。确认前不会产生任何写入。") + `<form id="init-confirm-form" data-path="${esc(path)}"><div class="modal-body"><div class="recent-path" style="margin-bottom:16px"><strong>目标空目录</strong><span class="mono">${esc(path)}</span></div><div class="summary-list"><div class="summary-row"><span>资产配置</span><span class="mono">adock.yaml / schemas/</span></div><div class="summary-row"><span>能力目录</span><span class="mono">prompts/ / skills/</span></div><div class="summary-row"><span>统一入口</span><span class="mono">README.md / CODEOWNERS</span></div><div class="summary-row"><span>示例资产</span><span>1 个 Prompt + 1 个多文件 Skill</span></div></div><div class="inline-notice warn" style="margin-top:17px">${icon("info")}<div>已有非空目录不得被静默覆盖。若检查失败，请按错误建议选择其他目录。</div></div><div class="modal-error"></div></div><div class="modal-foot"><button type="button" class="btn ghost" data-action="cancel-init" aria-label="取消初始化工作区">取消</button><button type="button" class="btn" data-action="init-back" data-path="${esc(path)}" aria-label="返回修改初始化目录">返回</button><button type="submit" class="btn primary" data-idle-label="确认初始化" data-busy-label="正在初始化…" aria-label="确认并初始化工作区">确认初始化</button></div></form>`, {kind:"init-confirm"});
+        openModal(modalHead("确认初始化工作区","请核对目标目录与创建范围。确认前不会产生任何写入。") + `<form id="init-confirm-form" data-path="${esc(path)}"><div class="modal-body"><div class="recent-path" style="margin-bottom:16px"><strong>目标空目录</strong><span class="mono">${esc(displayPath(path))}</span></div><div class="summary-list"><div class="summary-row"><span>资产配置</span><span class="mono">adock.yaml / schemas/</span></div><div class="summary-row"><span>能力目录</span><span class="mono">prompts/ / skills/</span></div><div class="summary-row"><span>统一入口</span><span class="mono">README.md / CODEOWNERS</span></div><div class="summary-row"><span>示例资产</span><span>1 个 Prompt + 1 个多文件 Skill</span></div></div><div class="inline-notice warn" style="margin-top:17px">${icon("info")}<div>已有非空目录不得被静默覆盖。若检查失败，请按错误建议选择其他目录。</div></div><div class="modal-error"></div></div><div class="modal-foot"><button type="button" class="btn ghost" data-action="cancel-init" aria-label="取消初始化工作区">取消</button><button type="button" class="btn" data-action="init-back" data-path="${esc(path)}" aria-label="返回修改初始化目录">返回</button><button type="submit" class="btn primary" data-idle-label="确认初始化" data-busy-label="正在初始化…" aria-label="确认并初始化工作区">确认初始化</button></div></form>`, {kind:"init-confirm"});
       }
 
       function openAssetGuide() {
         const root = state.workspace ? state.workspace.root : state.currentPath;
-        openModal(modalHead("新增资产与目录规范","本轮不内置另一套资产编辑器；请通过仓库和 Git 评审接收变更。") + `<div class="modal-body"><div class="summary-list"><div class="summary-row"><span>Prompt</span><span class="mono">prompts/&lt;prompt-id&gt;.md</span></div><div class="summary-row"><span>Skill</span><span class="mono">skills/&lt;skill-id&gt;/SKILL.md</span></div><div class="summary-row"><span>元数据</span><span>apiVersion、kind、id、title、description、owners、labels</span></div><div class="summary-row"><span>变更流程</span><span>修改 → 校验 → MR/PR → 评审合并</span></div></div>${root ? `<div class="recent-path" style="margin-top:17px"><strong>工作区</strong><span class="mono">${esc(root)}</span></div>` : ""}<div class="inline-notice" style="margin-top:17px">${icon("info")}<div>单个资产的 Front Matter 或 SKILL.md 错误会在该资产上隔离显示。修复后刷新即可重新读取。</div></div></div><div class="modal-foot"><button type="button" class="btn primary" data-action="close-modal" aria-label="关闭新增资产指引">知道了</button></div>`, {kind:"guide",wide:true});
+        openModal(modalHead("新增资产与目录规范","本轮不内置另一套资产编辑器；请通过仓库和 Git 评审接收变更。") + `<div class="modal-body"><div class="summary-list"><div class="summary-row"><span>Prompt</span><span class="mono">prompts/&lt;prompt-id&gt;.md</span></div><div class="summary-row"><span>Skill</span><span class="mono">skills/&lt;skill-id&gt;/SKILL.md</span></div><div class="summary-row"><span>元数据</span><span>apiVersion、kind、id、title、description、owners、labels</span></div><div class="summary-row"><span>变更流程</span><span>修改 → 校验 → MR/PR → 评审合并</span></div></div>${root ? `<div class="recent-path" style="margin-top:17px"><strong>工作区</strong><span class="mono">${esc(displayPath(root))}</span></div>` : ""}<div class="inline-notice" style="margin-top:17px">${icon("info")}<div>单个资产的 Front Matter 或 SKILL.md 错误会在该资产上隔离显示。修复后刷新即可重新读取。</div></div></div><div class="modal-foot"><button type="button" class="btn primary" data-action="close-modal" aria-label="关闭新增资产指引">知道了</button></div>`, {kind:"guide",wide:true});
       }
 
       function normalizeDiagnostics(result) {
@@ -987,14 +1073,14 @@
       function openDiagnostics(result) {
         const diagnostics = normalizeDiagnostics(result);
         const content = diagnostics.length ? `<div class="diagnostics">${diagnostics.map((item,index) => {
-          if (typeof item === "string") return `<article class="diagnostic"><div class="diagnostic-head"><span class="badge warn">诊断 ${index + 1}</span></div><p>${esc(item)}</p></article>`;
+          if (typeof item === "string") return `<article class="diagnostic"><div class="diagnostic-head"><span class="badge warn">诊断 ${index + 1}</span></div><p>${esc(displayDiagnostic(item))}</p></article>`;
           const diagnostic = item && typeof item === "object" ? item : {reason:String(item)};
           const severity = String(diagnostic.severity || diagnostic.level || "").toLowerCase();
-          const title = diagnostic.subject || diagnostic.path || diagnostic.operation || `诊断 ${index + 1}`;
-          const message = diagnostic.reason || diagnostic.message || diagnostic.description || "未提供诊断说明";
-          return `<article class="diagnostic"><div class="diagnostic-head"><span class="badge ${severity === "error" || diagnostic.code ? "error" : "warn"}">${esc(severity || (diagnostic.code ? "错误" : "诊断"))}</span><strong>${esc(title)}</strong>${diagnostic.code ? `<span class="tag mono">${esc(diagnostic.code)}</span>` : ""}</div><p>${esc(message)}</p>${diagnostic.suggestion ? `<p><strong>建议：</strong>${esc(diagnostic.suggestion)}</p>` : ""}${diagnostic.operation ? `<p class="mono soft">${esc(diagnostic.operation)}</p>` : ""}</article>`;
+          const title = displayDiagnostic(diagnostic.subject || diagnostic.path || diagnostic.operation || `诊断 ${index + 1}`);
+          const message = displayDiagnostic(diagnostic.reason || diagnostic.message || diagnostic.description || "未提供诊断说明");
+          return `<article class="diagnostic"><div class="diagnostic-head"><span class="badge ${severity === "error" || diagnostic.code ? "error" : "warn"}">${esc(severity || (diagnostic.code ? "错误" : "诊断"))}</span><strong>${esc(title)}</strong>${diagnostic.code ? `<span class="tag mono">${esc(diagnostic.code)}</span>` : ""}</div><p>${esc(message)}</p>${diagnostic.suggestion ? `<p><strong>建议：</strong>${esc(displayDiagnostic(diagnostic.suggestion))}</p>` : ""}${diagnostic.operation ? `<p class="mono soft">${esc(diagnostic.operation)}</p>` : ""}</article>`;
         }).join("")}</div>` : `<div class="diagnostics-empty"><div class="state-icon">${icon("check")}</div><strong>校验通过</strong><p>当前工作区未返回诊断。资产仍会在刷新时重新从事实源读取。</p></div>`;
-        openModal(modalHead("工作区校验",`${diagnostics.length} 条诊断 · ${state.workspace ? state.workspace.root : ""}`) + `<div class="modal-body">${content}</div><div class="modal-foot"><button type="button" class="btn" data-action="close-modal" aria-label="关闭校验结果">关闭</button><button type="button" class="btn primary" data-action="validate" aria-label="重新校验工作区">${icon("check")}重新校验</button></div>`, {kind:"diagnostics",wide:true});
+        openModal(modalHead("工作区校验",`${diagnostics.length} 条诊断 · ${state.workspace ? displayPath(state.workspace.root) : ""}`) + `<div class="modal-body">${content}</div><div class="modal-foot"><button type="button" class="btn" data-action="close-modal" aria-label="关闭校验结果">关闭</button><button type="button" class="btn primary" data-action="validate" aria-label="重新校验工作区">${icon("check")}重新校验</button></div>`, {kind:"diagnostics",wide:true});
       }
 
       async function validateWorkspace() {
@@ -1049,6 +1135,59 @@
         const entry = selectedEntry();
         if (!state.workspace || !entry || !entry.asset) return null;
         return {root:state.workspace.root,reference:assetRef(entry.asset)};
+      }
+
+      function openTargetConfigModal() {
+        const context = currentAssetContext();
+        const options = state.distribution.options;
+        const supported = options && Array.isArray(options.supported_targets) ? options.supported_targets : [];
+        if (!context || !supported.length) return;
+        const selected = supported.includes(state.distribution.target) ? state.distribution.target : supported[0];
+        const configured = state.distribution.mode === "custom" && options && Array.isArray(options.targets) ? options.targets.find(target => target.target === selected) : null;
+        const rootValue = configured ? displayPath(configured.root) : "";
+        const targetOptions = supported.map(target => `<option value="${esc(target)}" ${target === selected ? "selected" : ""}>${esc(target)}</option>`).join("");
+        openModal(modalHead("高级自定义目录",`标准分发会自动识别官方目录；这里仅为 ${context.reference} 配置特殊目录。`) + `<form id="target-config-form"><div class="modal-body"><div class="field"><label for="target-config-name">目标工具</label><select id="target-config-name" name="target" required aria-label="要配置的目标工具">${targetOptions}</select><small>仅列出支持当前资产类型的目标。</small></div><div class="field"><label for="target-root-path">自定义基准目录</label><div style="display:flex;gap:8px;align-items:center"><input class="mono" id="target-root-path" name="rootPath" value="${esc(rootValue)}" placeholder="例如 D:\\AI\\project 或 D:\\AI\\project\\.trae" required autocomplete="off" aria-label="自定义基准目录" style="flex:1;min-width:0"><button type="button" class="btn" data-action="pick-target-root">选择目录</button></div><small>输入工具官方目录的上一级基准目录；若已是 .trae 等官方工具目录则直接使用。相对路径以当前工作区为基准，也支持绝对路径与 ~ 用户目录。</small></div><div class="inline-notice">${icon("info")}<div>配置将写入 <span class="mono">adock.local.yaml</span> 并进入高级自定义模式；保留已有的本机目标与发布通道，不修改共享 <span class="mono">adock.yaml</span>。</div></div><div class="modal-error"></div></div><div class="modal-foot"><button type="button" class="btn" data-action="close-modal">取消</button><button type="submit" class="btn primary" data-idle-label="保存并使用" data-busy-label="正在保存…">保存并使用</button></div></form>`, {kind:"target-config"});
+      }
+
+      async function pickTargetRoot() {
+        const context = currentAssetContext();
+        const input = document.getElementById("target-root-path");
+        const button = document.querySelector('[data-action="pick-target-root"]');
+        if (!context || !input || !button) return;
+        button.disabled = true;
+        try {
+          const selected = await invoke("pick_directory", {startPath:context.root});
+          if (selected) {
+            input.value = displayPath(selected);
+            input.setCustomValidity("");
+            input.focus();
+          }
+        } catch (error) {
+          toast("无法打开目录选择器：" + normalizeError(error, "pick_directory", context.root).reason);
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      async function saveDistributionTarget(target, rootPath) {
+        const context = currentAssetContext();
+        if (!context || state.modalBusy) return;
+        setModalBusy(true);
+        try {
+          await invoke("configure_distribution_target", {path:context.root,reference:context.reference,target,rootPath});
+          const entry = selectedEntry();
+          closeModal(true);
+          state.distribution.mode = "custom";
+          state.distribution.target = target;
+          state.distribution.traeEdition = null;
+          state.distribution.options = null;
+          invalidateDistributionResults();
+          if (entry && entry.asset && assetRef(entry.asset) === context.reference) await loadDistributionOptions(entry);
+          toast(`已保存 ${target} 自定义目录；项目级或用户级可随时恢复自动分发`);
+        } catch (error) {
+          setModalBusy(false);
+          setModalError(normalizeError(error, "configure_distribution_target", target));
+        }
       }
 
       function openCreateTagModal() {
@@ -1210,6 +1349,13 @@
         } else if (event.target.id === "init-confirm-form") {
           event.preventDefault();
           initializeWorkspace(event.target.dataset.path || "");
+        } else if (event.target.id === "target-config-form") {
+          event.preventDefault();
+          const input = $("#target-root-path");
+          const rootPath = input.value.trim();
+          if (!rootPath) { input.setCustomValidity("请输入目标根目录"); input.reportValidity(); return; }
+          input.setCustomValidity("");
+          saveDistributionTarget($("#target-config-name").value, rootPath);
         } else if (event.target.id === "distribution-form") {
           event.preventDefault();
           previewDistribution();
@@ -1240,6 +1386,7 @@
         if (field === "search") {
           state.filters.search = event.target.value;
           renderKeepingFocus();
+          scheduleAssetFilter();
         }
         const distributionVariable = event.target.dataset.distributionVariable;
         if (distributionVariable) {
@@ -1248,7 +1395,7 @@
           invalidateDistributionResults();
           renderKeepingFocus();
         }
-        if (["open-workspace-path","init-workspace-path"].includes(event.target.id)) event.target.setCustomValidity("");
+        if (["open-workspace-path","init-workspace-path","target-root-path"].includes(event.target.id)) event.target.setCustomValidity("");
         if (event.target.id === "tag-name") {
           const context = currentAssetContext();
           const preview = $("#tag-full-preview");
@@ -1260,11 +1407,15 @@
         const field = event.target.dataset.field;
         if (["kind","owner","label"].includes(field)) {
           state.filters[field] = event.target.value;
-          renderKeepingFocus();
+          loadAssets(true);
         }
         const distributionField = event.target.dataset.distributionField;
         if (distributionField === "asset") {
           selectDistributionAsset(event.target.value);
+          return;
+        }
+        if (distributionField === "traeEdition") {
+          setDistributionTraeEdition(event.target.value);
           return;
         }
         if (distributionField === "target" || distributionField === "revision") {
@@ -1321,13 +1472,17 @@
           return;
         }
         if (action === "retry-detail") { loadDetail(selectedEntry()); return; }
-        if (action === "clear-filters") { state.filters = {search:"",kind:"all",owner:"all",label:"all"}; render(); return; }
+        if (action === "clear-filters") { state.filters = {search:"",kind:"all",owner:"all",label:"all"}; loadAssets(true); return; }
         if (action === "validate") { validateWorkspace(); return; }
         if (action === "asset-guide") { openAssetGuide(); return; }
         if (action === "retry-history") { loadAssetHistory(selectedEntry()); return; }
         if (action === "execute-distribution") { executeDistribution(); return; }
         if (action === "replan-distribution" || action === "retry-distribution") { previewDistribution(); return; }
         if (action === "retry-distribution-options") { loadDistributionOptions(selectedEntry()); return; }
+        if (action === "set-distribution-scope") { setDistributionScope(element.dataset.scope || "project"); return; }
+        if (action === "advanced-distribution") { openAdvancedDistribution(); return; }
+        if (action === "configure-target") { openTargetConfigModal(); return; }
+        if (action === "pick-target-root") { pickTargetRoot(); return; }
         if (action === "set-diff-from" || action === "set-diff-to") {
           state.version[action === "set-diff-from" ? "from" : "to"] = element.dataset.revision || "";
           invalidateVersionResults();

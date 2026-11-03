@@ -409,4 +409,113 @@ mod tests {
         let result = WorkspaceScanner::new(temp.path()).scan().unwrap();
         assert_eq!(result.assets.len(), 1);
     }
+
+    #[test]
+    fn keeps_valid_assets_and_locates_every_broken_entry() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("prompts")).unwrap();
+        fs::create_dir_all(temp.path().join("skills/good")).unwrap();
+        fs::create_dir_all(temp.path().join("skills/broken")).unwrap();
+        fs::create_dir_all(temp.path().join("skills/non-utf8")).unwrap();
+        fs::write(temp.path().join("prompts/good.md"), prompt("good")).unwrap();
+        fs::write(temp.path().join("prompts/broken.md"), "not front matter").unwrap();
+        fs::write(temp.path().join("prompts/non-utf8.md"), [0xff, 0xfe, 0xfd]).unwrap();
+        fs::write(temp.path().join("skills/good/SKILL.md"), skill("good")).unwrap();
+        fs::write(
+            temp.path().join("skills/broken/SKILL.md"),
+            "not front matter",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("skills/non-utf8/SKILL.md"),
+            [0xff, 0xfe, 0xfd],
+        )
+        .unwrap();
+
+        let result = WorkspaceScanner::new(temp.path()).scan().unwrap();
+        assert_eq!(result.assets.len(), 2);
+        for path in ["prompts/good.md", "skills/good/SKILL.md"] {
+            assert!(
+                result
+                    .assets
+                    .iter()
+                    .any(|asset| asset.source_files.first() == Some(&PathBuf::from(path)))
+            );
+        }
+        assert_eq!(result.issues.len(), 4);
+        for path in [
+            "prompts/broken.md",
+            "prompts/non-utf8.md",
+            "skills/broken/SKILL.md",
+            "skills/non-utf8/SKILL.md",
+        ] {
+            assert_eq!(
+                result
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.path == Path::new(path))
+                    .count(),
+                1,
+                "missing or duplicate issue for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn scans_binary_resources_and_portable_unicode_source_paths() {
+        let temp = TempDir::new().unwrap();
+        let resource = temp.path().join("skills/binary/资源/图标.bin");
+        fs::create_dir_all(resource.parent().unwrap()).unwrap();
+        fs::write(temp.path().join("skills/binary/SKILL.md"), skill("binary")).unwrap();
+        fs::write(
+            &resource,
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff],
+        )
+        .unwrap();
+
+        let result = WorkspaceScanner::new(temp.path()).scan().unwrap();
+        assert!(result.issues.is_empty());
+        assert_eq!(result.assets.len(), 1);
+        let sources = &result.assets[0].source_files;
+        assert!(
+            sources
+                .iter()
+                .any(|path| path.to_string_lossy() == "skills/binary/资源/图标.bin")
+        );
+        assert!(sources.iter().all(|path| {
+            let path = path.to_string_lossy();
+            path.contains('/') && !path.contains('\\')
+        }));
+    }
+
+    #[test]
+    fn scans_long_nested_relative_source_paths() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let nested = (0..18)
+            .map(|index| format!("level_{index:02}_abcdefghij"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let resource = root.join("skills/deep").join(&nested).join("asset.bin");
+        fs::create_dir_all(resource.parent().unwrap()).unwrap();
+        fs::write(root.join("skills/deep/SKILL.md"), skill("deep")).unwrap();
+        fs::write(&resource, [0x00, 0xff, 0x80]).unwrap();
+        let expected = format!("skills/deep/{nested}/asset.bin");
+        assert!(expected.len() > 260);
+
+        let result = WorkspaceScanner::new(&root).scan().unwrap();
+        assert!(result.issues.is_empty());
+        assert_eq!(result.assets.len(), 1);
+        let sources = &result.assets[0].source_files;
+        assert!(
+            sources
+                .iter()
+                .any(|path| path.to_string_lossy() == expected)
+        );
+        assert!(
+            sources
+                .iter()
+                .all(|path| !path.to_string_lossy().contains('\\'))
+        );
+    }
 }

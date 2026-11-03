@@ -83,38 +83,17 @@ impl DistributionService {
                 ));
             }
             ensure_safe_components(&target.root, &file.path)?;
-            let managed = manifest.files.get(&file.path);
-            let state = target_state(&target_path)?;
+            let managed_checksum = manifest
+                .files
+                .get(&file.path)
+                .map(|entry| entry.checksum.clone());
             let checksum = sha256(&file.content);
-            let previous_checksum = match state {
-                TargetState::File(ref checksum) => Some(checksum.clone()),
-                TargetState::Missing | TargetState::Other => None,
-            };
-            let (status, conflict) = match state {
-                TargetState::Missing => (PlannedFileStatus::Added, None),
-                TargetState::Other => (
-                    PlannedFileStatus::Conflict,
-                    Some(DistributionConflict::UnmanagedFile),
-                ),
-                TargetState::File(actual_checksum) => match managed {
-                    None => (
-                        PlannedFileStatus::Conflict,
-                        Some(DistributionConflict::UnmanagedFile),
-                    ),
-                    Some(entry) if entry.checksum == actual_checksum => {
-                        if actual_checksum == checksum {
-                            (PlannedFileStatus::Unchanged, None)
-                        } else {
-                            (PlannedFileStatus::Updated, None)
-                        }
-                    }
-                    Some(_) if overwrite_managed => (PlannedFileStatus::Updated, None),
-                    Some(_) => (
-                        PlannedFileStatus::Conflict,
-                        Some(DistributionConflict::LocallyModified),
-                    ),
-                },
-            };
+            let (previous_checksum, status, conflict) = observe_target(
+                &target_path,
+                &checksum,
+                managed_checksum.as_deref(),
+                overwrite_managed,
+            )?;
             planned_files.push(PlannedFile {
                 target_path,
                 relative_path: file.path,
@@ -123,7 +102,7 @@ impl DistributionService {
                 status,
                 conflict,
                 previous_checksum,
-                managed_checksum: managed.map(|entry| entry.checksum.clone()),
+                managed_checksum,
             });
         }
         let status = if planned_files.iter().any(|file| file.conflict.is_some()) {
@@ -139,6 +118,7 @@ impl DistributionService {
             commit,
             adapter_version,
             status,
+            overwrite_managed,
             files: planned_files,
         })
     }
@@ -166,21 +146,23 @@ impl DistributionService {
                 path: file.relative_path.clone(),
                 checksum: file.checksum.clone(),
             };
-            let outcome = match file.status {
-                PlannedFileStatus::Unchanged => {
-                    update_manifest(&plan.target_root, &mut manifest, entry)
-                        .map(|()| DistributionFileStatus::Unchanged)
-                }
-                PlannedFileStatus::Added | PlannedFileStatus::Updated => {
-                    writer(&file.target_path, &file.content)
-                        .and_then(|()| update_manifest(&plan.target_root, &mut manifest, entry))
-                        .map(|()| DistributionFileStatus::Written)
-                }
-                PlannedFileStatus::Conflict => Err(conflict_error(
-                    &file.relative_path,
-                    "a conflict remained in an executable plan",
-                )),
-            };
+            let outcome = ensure_safe_components(&plan.target_root, &file.relative_path)
+                .and_then(|()| validate_observed_state(plan, file, &manifest))
+                .and_then(|()| match file.status {
+                    PlannedFileStatus::Unchanged => {
+                        update_manifest(&plan.target_root, &mut manifest, entry)
+                            .map(|()| DistributionFileStatus::Unchanged)
+                    }
+                    PlannedFileStatus::Added | PlannedFileStatus::Updated => {
+                        writer(&file.target_path, &file.content)
+                            .and_then(|()| update_manifest(&plan.target_root, &mut manifest, entry))
+                            .map(|()| DistributionFileStatus::Written)
+                    }
+                    PlannedFileStatus::Conflict => Err(conflict_error(
+                        &file.relative_path,
+                        "a conflict remained in an executable plan",
+                    )),
+                });
             match outcome {
                 Ok(status) => results.push(DistributionFileResult {
                     target_path: file.target_path.clone(),
@@ -391,6 +373,52 @@ fn target_state(path: &Path) -> Result<TargetState, AppError> {
     }
 }
 
+fn observe_target(
+    path: &Path,
+    desired_checksum: &str,
+    managed_checksum: Option<&str>,
+    overwrite_managed: bool,
+) -> Result<
+    (
+        Option<String>,
+        PlannedFileStatus,
+        Option<DistributionConflict>,
+    ),
+    AppError,
+> {
+    let state = target_state(path)?;
+    let previous_checksum = match state {
+        TargetState::File(ref checksum) => Some(checksum.clone()),
+        TargetState::Missing | TargetState::Other => None,
+    };
+    let (status, conflict) = match state {
+        TargetState::Missing => (PlannedFileStatus::Added, None),
+        TargetState::Other => (
+            PlannedFileStatus::Conflict,
+            Some(DistributionConflict::UnmanagedFile),
+        ),
+        TargetState::File(actual_checksum) => match managed_checksum {
+            None => (
+                PlannedFileStatus::Conflict,
+                Some(DistributionConflict::UnmanagedFile),
+            ),
+            Some(managed) if managed == actual_checksum => {
+                if actual_checksum == desired_checksum {
+                    (PlannedFileStatus::Unchanged, None)
+                } else {
+                    (PlannedFileStatus::Updated, None)
+                }
+            }
+            Some(_) if overwrite_managed => (PlannedFileStatus::Updated, None),
+            Some(_) => (
+                PlannedFileStatus::Conflict,
+                Some(DistributionConflict::LocallyModified),
+            ),
+        },
+    };
+    Ok((previous_checksum, status, conflict))
+}
+
 fn target_read_error(path: &Path, error: std::io::Error) -> AppError {
     AppError::new(
         AppErrorCode::WorkspaceIo,
@@ -512,28 +540,47 @@ fn preflight(plan: &DistributionPlan) -> Result<DistributionManifest, AppError> 
             ));
         }
         ensure_safe_components(&plan.target_root, &file.relative_path)?;
-        let current = match target_state(&file.target_path)? {
-            TargetState::Missing => None,
-            TargetState::File(checksum) => Some(checksum),
-            TargetState::Other => {
-                return Err(conflict_error(
-                    &file.relative_path,
-                    "the target changed to a non-file after planning; regenerate the plan",
-                ));
-            }
-        };
-        let managed = manifest
-            .files
-            .get(&file.relative_path)
-            .map(|entry| entry.checksum.clone());
-        if current != file.previous_checksum || managed != file.managed_checksum {
-            return Err(conflict_error(
-                &file.relative_path,
-                "the target file or manifest changed after planning; regenerate the plan",
-            ));
-        }
+        validate_observed_state(plan, file, &manifest)?;
     }
     Ok(manifest)
+}
+
+fn validate_observed_state(
+    plan: &DistributionPlan,
+    file: &PlannedFile,
+    manifest: &DistributionManifest,
+) -> Result<(), AppError> {
+    let managed_checksum = manifest
+        .files
+        .get(&file.relative_path)
+        .map(|entry| entry.checksum.clone());
+    let (previous_checksum, status, conflict) = observe_target(
+        &file.target_path,
+        &file.checksum,
+        managed_checksum.as_deref(),
+        plan.overwrite_managed,
+    )?;
+    if previous_checksum != file.previous_checksum
+        || managed_checksum != file.managed_checksum
+        || status != file.status
+        || conflict != file.conflict
+    {
+        return Err(conflict_error(
+            &file.relative_path,
+            "the target state or plan safety metadata changed; regenerate the plan",
+        ));
+    }
+    match conflict {
+        Some(DistributionConflict::UnmanagedFile) => Err(conflict_error(
+            &file.relative_path,
+            "an unmanaged target file or directory blocks distribution",
+        )),
+        Some(DistributionConflict::LocallyModified) => Err(conflict_error(
+            &file.relative_path,
+            "a managed target file has local modifications",
+        )),
+        None => Ok(()),
+    }
 }
 
 fn conflict_error(subject: &str, reason: &str) -> AppError {
@@ -839,6 +886,93 @@ mod tests {
         let completed = DistributionService::execute(&retry).unwrap();
         assert_eq!(completed.status, DistributionExecutionStatus::Completed);
         assert_eq!(load_manifest(&target.root).unwrap().files.len(), 3);
+    }
+
+    #[test]
+    fn forged_ready_plans_cannot_bypass_unmanaged_or_local_modification_conflicts() {
+        let temp = TempDir::new().unwrap();
+        let target = target(&temp);
+        let adapter = adapter(&["commands/review.md"]);
+        let path = target.root.join("commands/review.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "unmanaged").unwrap();
+
+        let mut forged =
+            DistributionService::create_plan(&snapshot(), &target, &adapter, false).unwrap();
+        forged.status = DistributionPlanStatus::Ready;
+        forged.overwrite_managed = true;
+        forged.files[0].status = PlannedFileStatus::Updated;
+        forged.files[0].conflict = None;
+        assert_eq!(
+            DistributionService::execute(&forged).unwrap_err().code,
+            AppErrorCode::DistributionConflict
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "unmanaged");
+
+        fs::remove_file(&path).unwrap();
+        let initial =
+            DistributionService::create_plan(&snapshot(), &target, &adapter, false).unwrap();
+        DistributionService::execute(&initial).unwrap();
+        fs::write(&path, "local edit").unwrap();
+        let mut forged =
+            DistributionService::create_plan(&snapshot(), &target, &adapter, false).unwrap();
+        forged.status = DistributionPlanStatus::Ready;
+        forged.files[0].status = PlannedFileStatus::Updated;
+        forged.files[0].conflict = None;
+        assert_eq!(
+            DistributionService::execute(&forged).unwrap_err().code,
+            AppErrorCode::DistributionConflict
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "local edit");
+    }
+
+    #[test]
+    fn target_change_during_execution_is_reported_without_overwriting_it() {
+        let temp = TempDir::new().unwrap();
+        let target = target(&temp);
+        let adapter = adapter(&[
+            "commands/first.md",
+            "commands/second.md",
+            "commands/third.md",
+        ]);
+        let plan = DistributionService::create_plan(&snapshot(), &target, &adapter, false).unwrap();
+        let second_path = target.root.join("commands/second.md");
+        let result = DistributionService::execute_with_writer(&plan, |path, content| {
+            atomic_write(path, content, "distribution.file.write")?;
+            if path.ends_with("first.md") {
+                fs::write(&second_path, "external change")
+                    .map_err(|error| file_write_error("distribution.file.write", path, error))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(result.status, DistributionExecutionStatus::PartialFailed);
+        assert_eq!(result.files[0].status, DistributionFileStatus::Written);
+        assert_eq!(result.files[1].status, DistributionFileStatus::Failed);
+        assert_eq!(
+            result.files[1].error.as_ref().unwrap().code,
+            AppErrorCode::DistributionConflict
+        );
+        assert_eq!(result.files[2].status, DistributionFileStatus::Skipped);
+        assert_eq!(fs::read_to_string(second_path).unwrap(), "external change");
+        let manifest = load_manifest(&target.root).unwrap();
+        assert!(manifest.files.contains_key("commands/first.md"));
+        assert!(!manifest.files.contains_key("commands/second.md"));
+    }
+
+    #[test]
+    fn unavailable_target_root_fails_before_any_write() {
+        let temp = TempDir::new().unwrap();
+        let target = target(&temp);
+        let adapter = adapter(&["commands/review.md"]);
+        let plan = DistributionService::create_plan(&snapshot(), &target, &adapter, false).unwrap();
+        fs::write(&target.root, "not a directory").unwrap();
+
+        let error = DistributionService::execute(&plan).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::InvalidInput);
+        assert_eq!(fs::read_to_string(&target.root).unwrap(), "not a directory");
+        assert!(!target.root.join("commands/review.md").exists());
     }
 
     #[test]

@@ -61,9 +61,10 @@ fn default_channel() -> String {
     "prod".to_owned()
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalWorkspaceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_channel: Option<String>,
     #[serde(default)]
     pub targets: BTreeMap<String, TargetConfig>,
@@ -73,22 +74,38 @@ pub fn load_workspace_config(root: &Path) -> Result<WorkspaceConfig, AppError> {
     let shared_path = root.join(WORKSPACE_CONFIG_FILE);
     let shared: WorkspaceConfig = read_yaml(&shared_path)?;
     let local_path = root.join(LOCAL_WORKSPACE_CONFIG_FILE);
-    let local = match fs::metadata(&local_path) {
-        Ok(metadata) if metadata.is_file() => read_yaml(&local_path)?,
-        Ok(_) => {
-            return Err(config_error(
-                &local_path,
-                "local configuration path is not a file",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            LocalWorkspaceConfig::default()
-        }
-        Err(error) => {
-            return Err(config_error(&local_path, error.to_string()));
-        }
-    };
+    let local = read_local_config(&local_path)?;
     merge_configs(shared, local, home_dir().as_deref())
+}
+
+pub fn save_local_target(
+    workspace_root: &Path,
+    target: &str,
+    root: PathBuf,
+) -> Result<(), AppError> {
+    let shared: WorkspaceConfig = read_yaml(&workspace_root.join(WORKSPACE_CONFIG_FILE))?;
+    let local_path = workspace_root.join(LOCAL_WORKSPACE_CONFIG_FILE);
+    let mut local = read_local_config(&local_path)?;
+    local
+        .targets
+        .insert(target.to_owned(), TargetConfig { root });
+    merge_configs(shared, local.clone(), home_dir().as_deref())?;
+    let yaml = serde_yaml::to_string(&local)
+        .map_err(|error| config_error(&local_path, error.to_string()))?;
+    fs::write(&local_path, yaml).map_err(|error| config_error(&local_path, error.to_string()))?;
+    load_workspace_config(workspace_root)?;
+    Ok(())
+}
+
+fn read_local_config(path: &Path) -> Result<LocalWorkspaceConfig, AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => read_yaml(path),
+        Ok(_) => Err(config_error(path, "local configuration path is not a file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(LocalWorkspaceConfig::default())
+        }
+        Err(error) => Err(config_error(path, error.to_string())),
+    }
 }
 
 fn merge_configs(
@@ -170,7 +187,7 @@ fn home_error() -> AppError {
     )
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let value = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
     #[cfg(not(windows))]
@@ -231,6 +248,35 @@ mod tests {
         assert_eq!(merged.default_channel, "prod");
         assert_eq!(merged.targets["claude"].root, home.join(".claude"));
         assert_eq!(merged.targets["cursor"].root, PathBuf::from("cursor"));
+    }
+
+    #[test]
+    fn saving_a_local_target_preserves_other_local_settings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        fs::write(
+            temp.path().join(WORKSPACE_CONFIG_FILE),
+            "default_channel: prod\ntargets:\n  trae:\n    root: shared/trae\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join(LOCAL_WORKSPACE_CONFIG_FILE),
+            "default_channel: staging\ntargets:\n  cursor:\n    root: local/cursor\n",
+        )
+        .unwrap();
+
+        save_local_target(temp.path(), "workbuddy", PathBuf::from("local/workbuddy")).unwrap();
+
+        let local: LocalWorkspaceConfig =
+            read_yaml(&temp.path().join(LOCAL_WORKSPACE_CONFIG_FILE)).unwrap();
+        assert_eq!(local.default_channel.as_deref(), Some("staging"));
+        assert_eq!(local.targets["cursor"].root, PathBuf::from("local/cursor"));
+        assert_eq!(
+            local.targets["workbuddy"].root,
+            PathBuf::from("local/workbuddy")
+        );
+        let merged = load_workspace_config(temp.path()).unwrap();
+        assert_eq!(merged.default_channel, "staging");
+        assert_eq!(merged.targets["trae"].root, PathBuf::from("shared/trae"));
     }
 
     #[test]

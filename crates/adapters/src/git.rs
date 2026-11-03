@@ -37,24 +37,28 @@ impl GitCli {
     }
 
     fn run(&self, root: &Path, args: &[&OsStr]) -> Result<Output, AppError> {
-        Command::new(&self.executable)
-            .args(args)
-            .current_dir(root)
-            .output()
-            .map_err(|error| {
-                let code = if error.kind() == std::io::ErrorKind::NotFound {
-                    AppErrorCode::GitUnavailable
-                } else {
-                    AppErrorCode::GitCommandFailed
-                };
-                AppError::new(
-                    code,
-                    "git.execute",
-                    self.executable.display().to_string(),
-                    error.to_string(),
-                    "Install Git and ensure it is available on PATH",
-                )
-            })
+        let mut command = Command::new(&self.executable);
+        command.args(args).current_dir(root);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        command.output().map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                AppErrorCode::GitUnavailable
+            } else {
+                AppErrorCode::GitCommandFailed
+            };
+            AppError::new(
+                code,
+                "git.execute",
+                self.executable.display().to_string(),
+                error.to_string(),
+                "Install Git and ensure it is available on PATH",
+            )
+        })
     }
 
     fn output(&self, root: &Path, args: &[&OsStr], operation: &str) -> Result<Vec<u8>, AppError> {
@@ -911,6 +915,66 @@ mod tests {
             .rollback_preview(&fixture.skill, &RevisionSelector::Head)
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::DirtyAsset);
+    }
+
+    #[test]
+    fn rollback_rechecks_git_revision_and_external_asset_changes_before_writing() {
+        let fixture = Fixture::new();
+        let tag = VersionTag::new(fixture.skill.clone(), "v1.0.0").unwrap();
+        fixture
+            .repository
+            .create_tag(
+                &tag,
+                &RevisionSelector::Commit(fixture.first.clone()),
+                false,
+                false,
+            )
+            .unwrap();
+        let target = RevisionSelector::AssetTag(tag.clone());
+        fixture
+            .repository
+            .rollback_preview(&fixture.skill, &target)
+            .unwrap();
+
+        git(&fixture.root, &["tag", "--delete", &tag.to_string()]);
+        let error = fixture
+            .repository
+            .rollback(&fixture.skill, &target, true)
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::UnknownRevision);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("skills/onboard/SKILL.md")).unwrap(),
+            skill("Read second\n")
+        );
+
+        fixture
+            .repository
+            .create_tag(
+                &tag,
+                &RevisionSelector::Commit(fixture.first.clone()),
+                false,
+                false,
+            )
+            .unwrap();
+        fixture
+            .repository
+            .rollback_preview(&fixture.skill, &target)
+            .unwrap();
+        fs::write(
+            fixture.root.join("skills/onboard/SKILL.md"),
+            skill("External edit\n"),
+        )
+        .unwrap();
+        let error = fixture
+            .repository
+            .rollback(&fixture.skill, &target, true)
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::DirtyAsset);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("skills/onboard/SKILL.md")).unwrap(),
+            skill("External edit\n")
+        );
+        assert_eq!(head(&fixture.root), fixture.second);
     }
 
     #[test]

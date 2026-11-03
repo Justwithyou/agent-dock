@@ -657,7 +657,7 @@ fn distribute_previews_and_executes_prompt_and_skill_from_traceable_revisions() 
         &fixture.root,
         &["tag", "adock/skill/onboard/prod", &fixture.second],
     );
-    let prompt_path = fixture.root.join("target/trae/commands/review.md");
+    let prompt_path = fixture.root.join("target/trae/.trae/commands/review.md");
 
     adock(&fixture.root)
         .args([
@@ -740,10 +740,12 @@ fn distribute_previews_and_executes_prompt_and_skill_from_traceable_revisions() 
         )))
         .stdout(predicate::str::contains("updated |"));
 
-    let skill_entry = fixture.root.join("target/trae/skills/onboard/SKILL.md");
+    let skill_entry = fixture
+        .root
+        .join("target/trae/.trae/skills/onboard/SKILL.md");
     let skill_script = fixture
         .root
-        .join("target/trae/skills/onboard/scripts/run.sh");
+        .join("target/trae/.trae/skills/onboard/scripts/run.sh");
     adock(&fixture.root)
         .args([
             "distribute",
@@ -797,7 +799,7 @@ fn distribute_previews_and_executes_prompt_and_skill_from_traceable_revisions() 
 #[test]
 fn distribute_blocks_unmanaged_files_and_requires_explicit_managed_overwrite() {
     let fixture = Fixture::new();
-    let prompt_path = fixture.root.join("target/trae/commands/review.md");
+    let prompt_path = fixture.root.join("target/trae/.trae/commands/review.md");
     fs::create_dir_all(prompt_path.parent().unwrap()).unwrap();
     fs::write(&prompt_path, "unmanaged local file\n").unwrap();
 
@@ -910,4 +912,73 @@ fn distribute_blocks_unmanaged_files_and_requires_explicit_managed_overwrite() {
             .unwrap()
             .contains("Review PATCH in a concise style.")
     );
+}
+
+#[test]
+fn binary_resources_and_chinese_paths_survive_git_distribution_without_script_execution() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("资产 仓库");
+    fs::create_dir(&root).unwrap();
+    initialize_repository(&root);
+    fs::create_dir_all(root.join("skills/onboard/scripts")).unwrap();
+    fs::create_dir_all(root.join("skills/onboard/参考资料")).unwrap();
+    fs::write(
+        root.join("skills/onboard/SKILL.md"),
+        "---\napiVersion: adock/v1alpha1\nkind: skill\nid: onboard\ntitle: 中文入门\ndescription: 验证二进制资源和中文路径\nowners: [bob]\nspec:\n  triggers: [新仓库]\n  dependencies: []\n  entrypoint: scripts/run.cmd\n---\n只复制资源，不执行脚本。\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("skills/onboard/scripts/run.cmd"),
+        "@echo off\r\necho executed > script-executed.txt\r\n",
+    )
+    .unwrap();
+    let binary = [0, 159, 255, 10, 0, 128, 76, 54];
+    fs::write(root.join("skills/onboard/参考资料/图像.bin"), binary).unwrap();
+    commit_all(&root, "binary and unicode assets");
+    let commit = head(&root);
+
+    adock(&root)
+        .args([
+            "distribute",
+            "skill",
+            "onboard",
+            "--target",
+            "codex",
+            "--ref",
+            "HEAD",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Distribution completed from commit {commit}"
+        )));
+
+    let target = root.join("target/codex/.agents/skills/onboard");
+    assert_eq!(fs::read(target.join("参考资料/图像.bin")).unwrap(), binary);
+    assert!(
+        fs::read_to_string(target.join("scripts/run.cmd"))
+            .unwrap()
+            .contains("echo executed > script-executed.txt")
+    );
+    assert!(!root.join("script-executed.txt").exists());
+    assert!(!target.join("script-executed.txt").exists());
+    let manifest =
+        fs::read_to_string(root.join("target/codex/.agents/.adock/distribution-manifest.json"))
+            .unwrap();
+    assert!(manifest.contains(&commit));
+    assert!(manifest.contains("skills/onboard/参考资料/图像.bin"));
+}
+
+#[test]
+fn malformed_variable_arguments_are_redacted_from_stderr() {
+    let fixture = Fixture::new();
+    let secret = "top-secret-value-that-must-not-leak";
+
+    adock(&fixture.root)
+        .args(["show", "prompt", "review", "--var", secret])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("argument was redacted"))
+        .stderr(predicate::str::contains(secret).not());
 }

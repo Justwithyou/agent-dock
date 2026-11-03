@@ -2,11 +2,12 @@ use std::{collections::BTreeMap, path::Path};
 
 use adock_adapters::{
     DistributionRequest, DistributionTargetOptions, DistributionWorkflow, GitLogEntry,
-    GitRepository,
+    GitRepository, TraeEdition,
 };
 use adock_core::{
     AppError, AppErrorCode, Asset, AssetDiff, AssetRef, DistributionExecution, DistributionPlan,
-    RevisionSelector, ValidationReport, VersionTag, WorkspaceInfo, WorkspaceService,
+    DistributionScope, RevisionSelector, ValidationReport, VersionTag, WorkspaceInfo,
+    WorkspaceService,
 };
 use adock_infra::{
     AssetFilter, AssetService, DistributionService, FileSystemWorkspaceDiscovery,
@@ -36,9 +37,12 @@ fn initialize_workspace(path: String) -> Result<WorkspaceInfo, AppError> {
 }
 
 #[tauri::command]
-fn list_assets(path: String) -> Result<Vec<DesktopAssetListItem>, AppError> {
+fn list_assets(
+    path: String,
+    filter: Option<AssetFilter>,
+) -> Result<Vec<DesktopAssetListItem>, AppError> {
     let service = AssetService::new(path);
-    let result = service.list(&AssetFilter::default())?;
+    let result = service.list(&filter.unwrap_or_default())?;
     let mut entries = Vec::with_capacity(result.assets.len() + result.issues.len());
 
     for item in result.assets {
@@ -179,6 +183,77 @@ fn get_distribution_options(
 }
 
 #[tauri::command]
+fn get_scoped_distribution_options(
+    path: String,
+    reference: String,
+    scope: DistributionScope,
+    trae_edition: Option<TraeEdition>,
+) -> Result<DistributionTargetOptions, AppError> {
+    let root = discover_workspace(Some(path))?.root;
+    DistributionWorkflow::new(root).scoped_target_options(
+        &AssetRef::parse(&reference)?,
+        scope,
+        trae_edition,
+    )
+}
+
+#[tauri::command]
+fn configure_distribution_target(
+    path: String,
+    reference: String,
+    target: String,
+    root_path: String,
+) -> Result<DistributionTargetOptions, AppError> {
+    let root = discover_workspace(Some(path))?.root;
+    DistributionWorkflow::new(root).configure_target(
+        &AssetRef::parse(&reference)?,
+        &target,
+        root_path.into(),
+    )
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn preview_scoped_distribution(
+    path: String,
+    reference: String,
+    target: String,
+    scope: DistributionScope,
+    trae_edition: Option<TraeEdition>,
+    revision: Option<String>,
+    variables: BTreeMap<String, String>,
+    overwrite_managed: bool,
+) -> Result<DistributionPlan, AppError> {
+    let revision = revision
+        .filter(|revision| !revision.trim().is_empty())
+        .map(|revision| RevisionSelector::parse(&revision))
+        .transpose()?;
+    let root = discover_workspace(Some(path))?.root;
+    DistributionWorkflow::new(root).create_scoped_plan(
+        &DistributionRequest {
+            reference: AssetRef::parse(&reference)?,
+            target,
+            revision,
+            variables,
+            overwrite_managed,
+        },
+        scope,
+        trae_edition,
+    )
+}
+
+#[tauri::command]
+fn pick_directory(start_path: Option<String>) -> Option<String> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(start_path) = start_path.filter(|path| !path.trim().is_empty()) {
+        dialog = dialog.set_directory(start_path);
+    }
+    dialog
+        .pick_folder()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 fn preview_distribution(
     path: String,
     reference: String,
@@ -233,7 +308,11 @@ pub fn run() {
             preview_rollback,
             rollback_asset,
             get_distribution_options,
+            get_scoped_distribution_options,
+            configure_distribution_target,
+            pick_directory,
             preview_distribution,
+            preview_scoped_distribution,
             execute_distribution
         ])
         .run(tauri::generate_context!())
@@ -423,6 +502,8 @@ mod tests {
     #[test]
     fn asset_commands_share_core_services_and_isolate_broken_assets() {
         let temp = tempfile::TempDir::new().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        fs::write(temp.path().join("adock.yaml"), "targets: {}\n").unwrap();
         fs::create_dir_all(temp.path().join("prompts")).unwrap();
         fs::write(
             temp.path().join("prompts/review.md"),
@@ -431,7 +512,7 @@ mod tests {
         .unwrap();
         fs::write(temp.path().join("prompts/broken.md"), "broken").unwrap();
 
-        let entries = list_assets(temp.path().display().to_string()).unwrap();
+        let entries = list_assets(temp.path().display().to_string(), None).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(
             entries.iter().filter(|entry| entry.asset.is_some()).count(),
@@ -452,6 +533,27 @@ mod tests {
         let report = validate_workspace(temp.path().display().to_string()).unwrap();
         assert!(!report.valid);
         assert_eq!(report.asset_count, 1);
+
+        let filter = AssetFilter {
+            query: Some("ALICE".to_owned()),
+            ..AssetFilter::default()
+        };
+        let filtered = list_assets(temp.path().display().to_string(), Some(filter)).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].asset.as_ref().unwrap().metadata.id, "review");
+        let output = Command::cargo_bin("adock")
+            .unwrap()
+            .arg("--workspace")
+            .arg(temp.path())
+            .args(["list", "--query", "ALICE"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("prompt:review"));
+        assert!(!output.contains("broken.md"));
     }
 
     #[test]
@@ -690,6 +792,78 @@ mod tests {
     }
 
     #[test]
+    fn desktop_can_configure_a_supported_local_target_without_changing_shared_config() {
+        let fixture = VersionFixture::new();
+        let shared = fs::read_to_string(fixture.root.join("adock.yaml")).unwrap();
+
+        let options = configure_distribution_target(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "workbuddy".to_owned(),
+            "target/local-workbuddy".to_owned(),
+        )
+        .unwrap();
+
+        assert!(
+            options
+                .targets
+                .iter()
+                .any(|target| target.target == "workbuddy")
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("adock.yaml")).unwrap(),
+            shared
+        );
+        let local = fs::read_to_string(fixture.root.join("adock.local.yaml")).unwrap();
+        assert!(local.contains("workbuddy:"));
+        assert!(local.contains("root: target/local-workbuddy"));
+        let error = configure_distribution_target(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "codex".to_owned(),
+            "target/codex-prompt".to_owned(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::UnsupportedAdapter);
+    }
+
+    #[test]
+    fn scoped_distribution_commands_resolve_project_directories_without_custom_targets() {
+        let fixture = VersionFixture::new();
+        let workspace_root = fixture.root.canonicalize().unwrap();
+
+        let options = get_scoped_distribution_options(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            DistributionScope::Project,
+            None,
+        )
+        .unwrap();
+        assert_eq!(options.targets.len(), 4);
+        let trae = options
+            .targets
+            .iter()
+            .find(|target| target.target == "trae")
+            .unwrap();
+        assert_eq!(trae.root, workspace_root.join(".trae"));
+
+        let plan = preview_scoped_distribution(
+            fixture.path(),
+            "prompt:review".to_owned(),
+            "trae".to_owned(),
+            DistributionScope::Project,
+            None,
+            Some("HEAD".to_owned()),
+            BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.target_root, workspace_root.join(".trae"));
+        assert_eq!(plan.commit, fixture.second);
+        assert_eq!(plan.status, DistributionPlanStatus::Ready);
+    }
+
+    #[test]
     fn distribution_plans_and_execution_match_cli_for_prompts_and_skills() {
         let fixture = VersionFixture::new();
         write_renderable_prompt(&fixture.root, "prod prompt");
@@ -700,6 +874,10 @@ mod tests {
 
         let options = get_distribution_options(fixture.path(), "prompt:review".to_owned()).unwrap();
         assert_eq!(options.default_revision, "adock/prompt/review/prod");
+        assert_eq!(
+            options.supported_targets,
+            ["claude-code", "cursor", "trae", "workbuddy"]
+        );
         assert!(options.targets.iter().any(|target| target.target == "trae"));
 
         let variables = BTreeMap::from([
@@ -936,6 +1114,13 @@ mod tests {
         let output = assert.get_output();
         assert_cli_matches_plan(&output.stdout, &blocked);
         assert!(String::from_utf8_lossy(&output.stderr).contains("error[distribution_conflict]"));
+        let mut forged = blocked.clone();
+        forged.status = DistributionPlanStatus::Ready;
+        forged.overwrite_managed = true;
+        forged.files[0].status = PlannedFileStatus::Updated;
+        forged.files[0].conflict = None;
+        let error = execute_distribution(forged, true).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::DistributionConflict);
         let error = execute_distribution(blocked, true).unwrap_err();
         assert_eq!(error.code, AppErrorCode::DistributionConflict);
         assert_eq!(fs::read_to_string(&target_path).unwrap(), "unmanaged\n");

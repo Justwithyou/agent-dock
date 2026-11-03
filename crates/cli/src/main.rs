@@ -55,7 +55,7 @@ enum Commands {
         /// Filter by an exact classification label.
         #[arg(long)]
         label: Option<String>,
-        /// Case-insensitive search in id, title, and description.
+        /// Case-insensitive search in reference, id, title, description, owners, and labels.
         #[arg(long)]
         query: Option<String>,
     },
@@ -722,13 +722,13 @@ fn optional_asset_ref(
 fn parse_variables(values: &[String]) -> Result<BTreeMap<String, String>, AppError> {
     values
         .iter()
-        .map(|value| {
-            let (name, value) = value.split_once('=').ok_or_else(|| {
+        .map(|input| {
+            let (name, value) = input.split_once('=').ok_or_else(|| {
                 AppError::new(
                     AppErrorCode::InvalidInput,
                     "cli.var.parse",
-                    value,
-                    "expected NAME=VALUE",
+                    "--var",
+                    "expected NAME=VALUE; the supplied argument was redacted",
                     "Repeat --var with a variable name and value, for example --var change=PATCH",
                 )
             })?;

@@ -8,7 +8,10 @@ use std::{fs, path::Path};
 
 use adock_core::{AppError, AppErrorCode, WorkspaceDiscovery, WorkspaceInfo};
 
-pub use config::{LocalWorkspaceConfig, TargetConfig, WorkspaceConfig, load_workspace_config};
+pub use config::{
+    LocalWorkspaceConfig, TargetConfig, WorkspaceConfig, home_dir as user_home_dir,
+    load_workspace_config, save_local_target,
+};
 pub use distribution::{DistributionManifest, DistributionManifestEntry, DistributionService};
 pub use init::WorkspaceInitializer;
 pub use scanner::{ScanIssue, ScanResult, WorkspaceScanner};
